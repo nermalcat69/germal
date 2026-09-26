@@ -4,129 +4,86 @@
 
 # Germal
 
-**A native, cross-platform HTTP API client built with Rust + [GPUI](https://gpui.rs)**
-
-No Postman, Just Germal!
-
-GPU-rendered · Light on resources · No account · Your data stays local · No Electron, No Tauri, No WebView
+**A native desktop HTTP API client with a built-in load tester and a browser traffic recorder, written in Rust with [GPUI](https://gpui.rs).**
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-007EC6?style=flat-square)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-1.97%2B-CE422B?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org)
-[![GPUI](https://img.shields.io/badge/UI-GPUI-8B5CF6?style=flat-square)](https://gpui.rs)
-[![macOS](https://img.shields.io/badge/macOS-000000?style=flat-square&logo=apple&logoColor=white)](https://github.com/nermalcat69/germal/releases)
-[![Linux](https://img.shields.io/badge/Linux-FCC624?style=flat-square&logo=linux&logoColor=black)](https://github.com/nermalcat69/germal/releases)
-[![Windows](https://img.shields.io/badge/Windows-0078D6?style=flat-square&logo=windows&logoColor=white)](https://github.com/nermalcat69/germal/releases)
 
 <img src="assets/screenshot.png" width="900" alt="Germal main window: request builder on the left, response viewer on the right">
 
 </div>
 
-> **Germal is a fork of [GetCat](https://github.com/finch-xu/GetCat)** by [finch-xu](https://github.com/finch-xu), used under the Apache-2.0 license. Full credit for the original app goes to its author. Everything GetCat does, Germal still does — plus the additions listed under *Added in Germal* below.
+> Germal is a fork of [GetCat](https://github.com/finch-xu/GetCat) by [finch-xu](https://github.com/finch-xu), used under the Apache-2.0 license.
 
-## Added in Germal
+## Features
 
-- **Load tester**: pick any request (the current tab, or a recorded one), edit its URL and method, and fire it N times at a chosen concurrency. Live progress, failures, status codes, latency percentiles, elapsed time, and the target host's IPv4 / IPv6 addresses, hosting provider (ASN) and DNS servers — all on a dedicated page.
-- **Recorder**: opens a Chromium window and records the API (xhr / fetch) requests of every page you visit into a local SQLite database — headers (including Authorization and cookies), bodies, timing, connection and TLS details. Requests are organized per project, then by domain and subdomain, with GET / POST / other filters; right-click a request to copy it as cURL or send it to the load tester.
-- **`.germal` files**: `germal-rec export` compresses (zstd) and then encrypts (AES-256-GCM, key derived from your passphrase with Argon2id) a recording database into a single `.germal` file; `germal-rec unpack` restores it.
+### Requests
 
-## Highlights
+- Methods: GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS.
+- Path parameters (`{name}` in the URL), query parameters and headers.
+- Bodies: form-data (text and file fields), x-www-form-urlencoded, raw JSON / Text / XML, or a binary file.
+- Large responses are streamed with live progress and can be cancelled. Up to 5 MB opens in the highlighted editor, up to 64 MB in a virtualized line view, and anything larger is written to disk with a preview and a save button.
+- Server-sent events render as they arrive. OpenAI Chat Completions / Responses and Anthropic Messages streams are recognized, with event list, assembled text and raw views, plus time to first token, event count, token usage and generation rate.
+- Copy a request as cURL or Python, or paste a cURL command to open it as a new tab.
+- Variables at global, category and environment scope (`{{var}}`, `{{$timestamp}}`), pre-request variable setting, post-response extraction and assertions, Postman environment import / export, and masked secret variables.
+- Saved requests, drafts and settings are plain JSON files. Nothing is uploaded and no response history is stored.
 
-- **Native and fast**: a GPU-rendered native window — not Electron, Tauri, or a WebView. One interface across macOS, Linux, and Windows.
-- **Large responses stay smooth**: streamed reception, live progress, cancel at any time. Up to 5 MB opens in the highlighted editor, up to 64 MB is line-virtualized (still selectable and copyable with ⌘C), and anything larger spills to disk with a preview and one-click save — a few hundred MB won't lock up the UI. Body and headers each have a one-click copy.
-- **Complete request building**: GET / POST / PUT / PATCH / DELETE / HEAD / OPTIONS; path parameters (`{name}` in the URL), query, and headers; bodies as form-data (text and file fields, files streamed with a known length), x-www-form-urlencoded, raw JSON / Text / XML, or a whole binary file.
-- **LLM streaming debugging**: SSE (text/event-stream) responses render as they arrive — no waiting for the stream to finish. The stream formats of OpenAI Chat Completions / Responses and Anthropic Messages are recognized automatically, with three views (event list / assembled text / raw) plus TTFT, event count, token usage, and generation-rate stats. The sidebar ships request templates for all three APIs (plain text / with image / streaming), and for both MCP protocol eras.
-- **Commands in and out**: the right-hand rail turns the current request into a cURL / Python snippet, and takes one back — paste a curl command (a browser's "Copy as cURL" works as-is) and it becomes a new tab, with anything that couldn't be carried over listed explicitly.
-- **Variables & pre/post operations**: global / category / environment scopes with `{{var}}` and `{{$timestamp}}`; set variables before sending, extract response fields and assert afterwards — no scripting; Postman environment import/export; secret variables are masked in the UI.
-- **Your data is yours**: no history, no stored responses, nothing uploaded anywhere. Saved requests, drafts, and settings are pretty-printed JSON files you can hand-edit and track in Git.
-- **Theme and language follow the system**, or pin them to light / dark and English / Chinese / Japanese. The title bar is custom-drawn, so all three platforms look the same.
-- **Accessible**: every control has an accessible name and works with screen readers.
+### Load tester
+
+- Test any request: the current tab's, or one from the recorder. The target's method and URL are editable.
+- Set the number of requests and the concurrency.
+- A dedicated page updates live while it runs: progress, requests sent, completed, failed and in flight, elapsed time (in seconds, minutes, hours or days), requests per second, status code distribution, failure reasons, and latency min / p50 / p90 / p99 / max.
+- Target host details from DNS: IPv4 and IPv6 addresses, hosting provider (ASN), reverse hostname, network range and DNS servers.
+- Copy the results as text.
+
+### Recorder
+
+- Opens a Chromium window and records the API (xhr / fetch) requests of every page you visit into a local SQLite database.
+- For each request: method, URL, request and response headers (including Authorization and cookies), request and response bodies, status, timing (DNS, connect, TLS, send, wait), size, protocol, remote IP, TLS certificate details, initiator and redirect chain.
+- Organized by project (with a project dropdown), then by domain and subdomain, with All / GET / POST / Other filters.
+- A running clock shows how long the recording has been going.
+- Right-click a request to copy its URL, copy it as cURL, or send it to the load tester.
+
+### `.germal` files
+
+`germal-rec export <file>` compresses a recording database with zstd and then encrypts it with AES-256-GCM into a single `.germal` file. The key is derived from a passphrase with Argon2id. `germal-rec unpack <file> <db>` restores it. The passphrase is prompted for, or read from `GERMAL_PASSPHRASE`.
+
+### Command line
+
+`germal-rec` records, lists, imports, exports and load-tests from the terminal:
+
+```bash
+germal-rec record --project "My project" --url https://example.com
+germal-rec list --method POST --host api.example.com
+germal-rec load <id> -n 200 -c 20
+germal-rec export recordings.germal
+germal-rec unpack recordings.germal restored.db
+```
 
 ## Install
 
-Downloads are attached to GitHub Releases once a release has been published.
+Packages are attached to [GitHub Releases](https://github.com/nermalcat69/germal/releases) once a release is published.
 
-Download the package for your platform [GitHub Releases](https://github.com/nermalcat69/germal/releases)
-
-<table>
-  <thead>
-    <tr><th>Platform</th><th>File</th><th>Download</th><th>Notes</th></tr>
-  </thead>
-  <tbody>
-    <tr><td>macOS (Apple Silicon)</td><td><code>Germal-macos-arm64.dmg</code></td><td><a href="https://github.com/nermalcat69/germal/releases/latest/download/Germal-macos-arm64.dmg">Download</a></td><td rowspan="2">Signed and notarized — drag it into Applications</td></tr>
-    <tr><td>macOS (Intel)</td><td><code>Germal-macos-x64.dmg</code></td><td><a href="https://github.com/nermalcat69/germal/releases/latest/download/Germal-macos-x64.dmg">Download</a></td></tr>
-    <tr><td>Linux (x64)</td><td><code>Germal-linux-x64.tar.gz</code></td><td><a href="https://github.com/nermalcat69/germal/releases/latest/download/Germal-linux-x64.tar.gz">Download</a></td><td rowspan="2">Unpacks to <code>germal</code> — see the system requirements below</td></tr>
-    <tr><td>Linux (arm64)</td><td><code>Germal-linux-arm64.tar.gz</code></td><td><a href="https://github.com/nermalcat69/germal/releases/latest/download/Germal-linux-arm64.tar.gz">Download</a></td></tr>
-    <tr><td>Windows (portable, x64) <strong>Recommended</strong></td><td><code>Germal-windows-x64.exe</code></td><td><a href="https://github.com/nermalcat69/germal/releases/latest/download/Germal-windows-x64.exe">Download</a></td><td rowspan="2">Single file, runs from anywhere — see the system requirements below</td></tr>
-    <tr><td>Windows (portable, arm64) <strong>Recommended</strong></td><td><code>Germal-windows-arm64.exe</code></td><td><a href="https://github.com/nermalcat69/germal/releases/latest/download/Germal-windows-arm64.exe">Download</a></td></tr>
-    <tr><td>Windows (installer, x64)</td><td><code>Germal-windows-x64.msi</code></td><td><a href="https://github.com/nermalcat69/germal/releases/latest/download/Germal-windows-x64.msi">Download</a></td><td rowspan="2">Installs per-user, no administrator needed; launches from the Start menu</td></tr>
-    <tr><td>Windows (installer, arm64)</td><td><code>Germal-windows-arm64.msi</code></td><td><a href="https://github.com/nermalcat69/germal/releases/latest/download/Germal-windows-arm64.msi">Download</a></td></tr>
-  </tbody>
-</table>
-
-<details>
-<summary>Supported Linux distributions</summary>
-
-Runs on mainstream desktop distributions from 2022 onward: **Ubuntu 22.04+**, **Debian 12+**, **Fedora 36+**, **Linux Mint 21+**, **openSUSE Leap 15.6+**, and rolling releases such as Arch and openSUSE Tumbleweed. Graphics drivers on these work out of the box — there is nothing extra to install.
-
-Older releases won't run it: Ubuntu 20.04, Debian 11, and RHEL / Rocky / AlmaLinux 9 all sit below the glibc 2.35 floor.
-
-Unpack it and run `./germal`. To have it show up in the app grid (Ubuntu's "Show Applications") and the dock, turn on **Settings → General → Add to application menu**: Germal writes a launcher and icon under `~/.local/share`, after which the Super key finds it and a right-click can "Add to Favorites" to pin it. Turn the switch off to remove them. On Wayland the window and dock icon also come from this launcher, so without it the taskbar shows a generic icon.
-
-The launcher points at the current executable, so put `germal` somewhere permanent before enabling it, for example:
-
-```bash
-tar -xzf Germal-linux-x64.tar.gz
-install -Dm755 germal ~/.local/bin/germal
-~/.local/bin/germal
-```
-
-If you move the file later, toggle the switch off and on again to refresh the path.
-
-</details>
-
-<details>
-<summary>Blank window on Linux, or a Vulkan / no GPU found error</summary>
-
-The interface is GPU-rendered through Vulkan. Desktop distributions normally ship the driver already, so check first:
-
-```bash
-vulkaninfo --summary
-```
-
-If that prints nothing or reports no devices, install the driver for your GPU:
-
-| Environment | Command |
+| Platform | File |
 |---|---|
-| Ubuntu / Debian with Intel or AMD graphics | `sudo apt install mesa-vulkan-drivers` |
-| Fedora with Intel or AMD graphics | `sudo dnf install mesa-vulkan-drivers` |
-| Arch with Intel or AMD graphics | `sudo pacman -S vulkan-intel` or `vulkan-radeon` |
-| NVIDIA graphics | Install the proprietary driver (e.g. `nvidia-driver-550`); the open-source nouveau driver has no Vulkan |
-| Virtual machine / no discrete GPU | Install `mesa-vulkan-drivers` to fall back to lavapipe software rendering — usable but slow |
+| macOS (Apple Silicon) | `Germal-macos-arm64.dmg` |
+| macOS (Intel) | `Germal-macos-x64.dmg` |
+| Linux (x64) | `Germal-linux-x64.tar.gz` |
+| Linux (arm64) | `Germal-linux-arm64.tar.gz` |
+| Windows (x64) | `Germal-windows-x64.exe` (portable) or `.msi` (installer) |
+| Windows (arm64) | `Germal-windows-arm64.exe` (portable) or `.msi` (installer) |
 
-</details>
+The recorder needs Google Chrome or Chromium installed.
 
-<details>
-<summary>Supported Windows versions</summary>
-
-Requires **Windows 10 1803 (April 2018 Update) or later**, or Windows 11. The interface renders through Direct3D 11, so graphics hardware from around 2010 is enough (feature level 10.1 and up) — DirectX 12 is not required.
-
-Either build works; the portable build is recommended (on ARM devices such as Snapdragon laptops, grab the `-arm64` package):
-
-- **`Germal-windows-<arch>.exe` (portable, recommended)**: a single file — keep it on a USB stick or anywhere else and double-click it; nothing is written to the registry.
-- **`Germal-windows-<arch>.msi` (installer)**: installs into `%LOCALAPPDATA%\Programs\Germal`, needs no administrator rights, adds a Start menu entry, and uninstalls from Apps & features.
-
-In-app updates work for both: an MSI install pulls the new MSI and upgrades silently, while the portable build replaces its own exe.
-
-Neither is code-signed yet, so SmartScreen will stop it the first time. For the portable exe, click **More info** → **Run anyway**; the MSI is an installer so the warning is more prominent, but it clears the same way.
-
-</details>
+Linux needs Vulkan drivers (`vulkaninfo --summary` should list a device) and glibc 2.35 or newer, for example Ubuntu 22.04+, Debian 12+ or Fedora 36+. Windows needs Windows 10 1803 or later.
 
 ## Usage
 
-1. Pick a method, type a URL, and press **⌘ Enter** (Ctrl Enter on Windows / Linux) to send.
-2. Fill in parameters under the Params / Headers / Body tabs; any `{name}` in the URL shows up automatically in the path parameter table.
-3. The response pane shows status / time / size, toggles between Pretty and Raw, searches with **⌘ F**, and saves to a file.
-4. **⌘ S** saves the request to the sidebar — click it later to load it back. Saved requests support one-level categories: pick or create a category when saving, browse by category in the sidebar.
+1. Pick a method, type a URL and press **⌘ Enter** (Ctrl Enter on Windows / Linux).
+2. Fill in parameters under the Params / Headers / Body tabs.
+3. The response pane shows status, time and size, switches between Pretty and Raw, searches with **⌘ F** and saves to a file.
+4. **⌘ S** saves the request to the sidebar. Saved requests can be grouped into categories.
+5. The left rail also holds the load tester and the recorder.
 
 | Action | macOS | Windows / Linux |
 |---|---|---|
@@ -137,66 +94,51 @@ Neither is code-signed yet, so SmartScreen will stop it the first time. For the 
 | Search in response | ⌘ F | Ctrl F |
 | Settings | ⌘ , | Ctrl , |
 
-Settings cover the interface language (system / English / Chinese / Japanese), request timeout, redirects, TLS verification, editor font size, and whether to check for updates at startup.
-
 ### Data directory
 
 | Platform | Directory |
 |---|---|
 | macOS | `~/Library/Application Support/Germal/` |
-| Linux | `$XDG_DATA_HOME/germal/` (defaults to `~/.local/share/germal/`) |
+| Linux | `$XDG_DATA_HOME/germal/` (default `~/.local/share/germal/`) |
 | Windows | `%APPDATA%\Germal\data\` |
 
 ```
-workspace.json          # tab order, sidebar, split direction, theme preference
+workspace.json          # tabs, sidebar, split direction, theme
 requests/<ulid>.json    # one file per saved request
 drafts/<tab-id>.json    # one draft per tab
 settings.json           # application settings
+recordings.db           # recorder database (SQLite)
 ```
 
-Writes are atomic (temp file → rename), so a crash never leaves a half-written file; a file that fails to parse is renamed to `.corrupt-<timestamp>` and skipped. Headers such as `Authorization` are stored in plain text (same as Postman's and Insomnia's local stores), with 0600 file permissions on Unix.
+An existing GetCat data folder is moved to the Germal location on first launch. Headers such as `Authorization` are stored in plain text, with 0600 file permissions on Unix.
 
 ## Development
 
-### Architecture
-
 ```
 crates/
-├─ germal-core   # UI-free core: request model, sending (reqwest + tokio), large-response tiering and spill-to-disk, JSON file storage
-└─ germal-app    # GPUI interface: Workspace / RequestTab state, settings dialog, in-app updates
+├─ germal-core      # request model, sending (reqwest + tokio), load tester, host/DNS lookup, JSON storage
+├─ germal-recorder  # Chromium recorder (chromiumoxide), SQLite storage, .germal files, germal-rec CLI
+└─ germal-app       # GPUI interface
 ```
 
-- The UI is built on Zed's [gpui](https://github.com/zed-industries/zed/tree/main/crates/gpui) plus [GPUI Kit](https://github.com/longbridge/gpui-kit) (the gpui-component library). Following the Kit 0.6 convention, the app depends on the single crates.io `gpui-kit` crate, which pins the matching gpui release.
-- Networking runs on the tokio runtime and results come back to the GPUI main thread over a channel; background work (pretty-printing, indexing) is wrapped in `catch_unwind`, so a panic only surfaces as a "background processing error".
-- There is no database: `germal-core/src/store` handles reads and writes, with writes on a dedicated thread coalesced over 500 ms.
-
-### Building and debugging
-
-- Rust ≥ 1.97 (edition 2024). macOS needs no extra toolchain; Linux needs Vulkan plus the Wayland / X11 / fontconfig headers (the full list is in `.github/workflows/ci.yml`); Windows needs the MSVC toolchain, and Direct3D 11 ships with the Windows SDK.
-- App logo: `crates/germal-app/assets/logo/cat.png` is the background-free original, and `scripts/gen-logo.py` composes it into three outputs — the embedded `germal.png`, the macOS icon source `resources/macos/germal-1024.png`, and the Windows exe icon `resources/windows/germal.ico`. After changing the logo, rerun the script by hand and commit the output (CI does not generate it; requires `pip install pillow numpy`).
-- The Windows exe icon and version info are embedded by `crates/germal-app/build.rs`, and only when compiling natively on Windows (an exe cross-compiled from macOS has no icon). The installer is defined in `crates/germal-app/resources/windows/Germal.wxs` and needs WiX v6: `dotnet tool install --global wix --version 6.*`.
+Requires Rust 1.97 or newer. On Linux, install Vulkan and the Wayland / X11 / fontconfig development headers (the full list is in `.github/workflows/ci.yml`). On Windows, install the MSVC toolchain.
 
 ```bash
-cargo run -p germal-app                         # run
-cargo test --workspace                          # unit + wiremock + gpui TestAppContext tests
-RUST_LOG=debug cargo run -p germal-app          # change the log level
-cargo run -p germal-app --features inspector    # element inspector: ⌘⌥I / Ctrl+Shift+I to see ids and roles
-GERMAL_UPDATE_CHECK=1 cargo run -p germal-app   # make dev builds check for updates at startup too (check only, no install)
+cargo run -p germal-app                         # run the app
+cargo run -p germal-recorder -- --help          # recorder CLI
+cargo test --workspace                          # tests
+cargo fmt --all
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Local test endpoints: `tools/testserver/server.py` is a dependency-free (Python standard library only) server that deliberately misbehaves — slow responses, huge bodies (1 / 5 / 10 / 20 / 50 MB), chunked dripping, LLM SSE streams (both OpenAI and Anthropic event formats, usage included), a minimal MCP endpoint, arbitrary status codes, mid-transfer disconnects, and floods of oversized response headers. Use it to exercise large-response tiering, streaming progress, and cancellation by hand. Its home page lists every endpoint with its parameters, and each example copies a full URL straight into Germal.
+`tools/testserver/server.py` is a local test server (slow and huge responses, chunked bodies, LLM event streams, arbitrary status codes, mid-transfer disconnects): `python3 tools/testserver/server.py`.
 
-```bash
-python3 tools/testserver/server.py                             # 127.0.0.1:8765, home page = endpoint list
-python3 tools/testserver/server.py --port 9000 --host 0.0.0.0  # different port / reachable from other devices
-```
-
-Before committing: `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`. CI builds and tests on all three platforms and uses cargo-deny to block copyleft dependencies.
+GitHub Actions: `ci.yml` checks formatting, lints and tests on every push. `release.yml` builds all platform packages when started manually or when a `vX.Y.Z` tag is pushed, and creates a draft release for tags.
 
 ## License
 
-[Apache-2.0](LICENSE). The third-party dependency list is in [THIRD-PARTY.md](THIRD-PARTY.md).
+[Apache-2.0](LICENSE). Third-party dependencies are listed in [THIRD-PARTY.md](THIRD-PARTY.md).
 
 ## Acknowledgements
 
-Germal is a fork of [GetCat](https://github.com/finch-xu/GetCat) by finch-xu. The request builder, response viewer, variables and the rest of the base app come from GetCat; the load tester, recorder and `.germal` export are added here. Both projects are licensed under Apache-2.0 (see `LICENSE`).
+Germal is a fork of [GetCat](https://github.com/finch-xu/GetCat) by finch-xu. The request builder, response viewer, variables and the rest of the base app come from GetCat; the load tester, recorder and `.germal` files are added here.
