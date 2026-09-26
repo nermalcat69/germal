@@ -1,0 +1,1582 @@
+//! HTTP 引擎：把 RequestDraft 变成 reqwest 请求，流式接收响应并上报进度。
+
+mod error;
+
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use bytes::{Bytes, BytesMut};
+use futures::StreamExt;
+use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
+use tokio::io::AsyncWriteExt;
+use tokio::sync::mpsc;
+use url::Url;
+
+pub use error::RequestError;
+
+use crate::body::spill::{HEAD_BYTES, SpillFile};
+use crate::model::{
+    BodyKind, FormValue, HttpVersionPref, Method, RequestDraft, RequestSettings, ResponseMeta,
+};
+use crate::tls;
+use crate::url::build_url;
+
+pub type Client = reqwest::Client;
+
+pub const USER_AGENT_VALUE: &str = concat!("Germal/", env!("CARGO_PKG_VERSION"));
+
+/// 每次请求自动带上的默认请求头，作为 reqwest 的 client 级 default headers 下发。
+/// 值固定不可编辑，用户只能整条开关（见 [`RequestSettings::disabled_default_headers`]）。
+/// 数组顺序即界面上的展示顺序。
+///
+/// 合并语义由 reqwest 负责：发请求时以 vacant-entry 方式合入，所以请求自己填的
+/// 同名 header 天然优先，这里不需要任何合并代码。
+///
+/// 几条值得记下的取舍：
+/// - `Accept-Encoding` 的取值必须与本 crate 开启的解压 feature 一致（gzip / brotli /
+///   zstd，**没有** deflate）。多报一个 deflate，服务端真回 `Content-Encoding: deflate`
+///   时解压中间件会走 identity 分支，响应体直接变成一堆压缩字节。
+/// - `Connection` 对 HTTP/1.1 而言是协议默认、对 HTTP/2 会被 hyper 静默剔除，
+///   两边都不产生实际效果；留着只是为了让这份「默认发了什么」的清单是完整的。
+pub const DEFAULT_HEADERS: &[(&str, &str)] = &[
+    ("Accept", "*/*"),
+    ("Accept-Encoding", "gzip, br, zstd"),
+    ("User-Agent", USER_AGENT_VALUE),
+    ("Connection", "keep-alive"),
+];
+
+/// `DEFAULT_HEADERS` 里那条 `Accept-Encoding` 的 key，`build_client_tuned` 要单独认它。
+const ACCEPT_ENCODING_KEY: &str = "accept-encoding";
+
+/// 某条默认头是否启用。`disabled` 存的是小写 key。
+pub fn default_header_enabled(disabled: &[String], key: &str) -> bool {
+    !disabled.iter().any(|d| d.eq_ignore_ascii_case(key))
+}
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub const PROGRESS_INTERVAL: Duration = Duration::from_millis(33);
+/// 响应体驻留内存的阈值；超过即落盘为 `BodyStore::Spilled`，没有总上限。
+pub const MAX_BODY_BYTES: u64 = 64 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutboundBody {
+    Empty,
+    Bytes {
+        content_type: String,
+        data: Vec<u8>,
+    },
+    /// multipart/form-data：文本 part 直接带值；文件 part 发送时打开、定长流式，内容不进内存。
+    Multipart {
+        parts: Vec<OutboundPart>,
+    },
+    /// 整文件流式上传（binary）：发送时打开、按块读取，内容不进内存。
+    File {
+        path: PathBuf,
+        content_type: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutboundPart {
+    Text {
+        name: String,
+        value: String,
+    },
+    File {
+        name: String,
+        path: PathBuf,
+        /// None 表示按扩展名猜。
+        content_type: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct HttpRequest {
+    pub method: Method,
+    pub url: Url,
+    pub headers: Vec<(String, String)>,
+    pub body: OutboundBody,
+}
+
+/// 响应体存储。
+#[derive(Debug, Clone)]
+pub enum BodyStore {
+    /// ≤ MAX_BODY_BYTES：全部在内存。`Bytes` 由接收缓冲 `freeze()` 而来，不再整体拷贝一次。
+    Memory(Bytes),
+    /// > MAX_BODY_BYTES：内容在临时文件，内存只保留前 HEAD_BYTES
+    Spilled {
+        file: Arc<SpillFile>,
+        len: u64,
+        head: Arc<[u8]>,
+    },
+}
+
+impl BodyStore {
+    /// 驻留内存的响应体；`Vec<u8>` / `&'static [u8]` 零拷贝接管（测试用，免去调用方导入 `bytes`）。
+    pub fn in_memory(bytes: impl Into<Bytes>) -> BodyStore {
+        BodyStore::Memory(bytes.into())
+    }
+
+    pub fn len(&self) -> u64 {
+        match self {
+            BodyStore::Memory(b) => b.len() as u64,
+            BodyStore::Spilled { len, .. } => *len,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn is_spilled(&self) -> bool {
+        matches!(self, BodyStore::Spilled { .. })
+    }
+
+    /// 全部字节；仅 Memory 有。
+    pub fn memory(&self) -> Option<&[u8]> {
+        match self {
+            BodyStore::Memory(b) => Some(&b[..]),
+            BodyStore::Spilled { .. } => None,
+        }
+    }
+
+    /// 前 `n` 字节：Memory 取切片；Spilled 取 head 的切片（最多 HEAD_BYTES）。
+    pub fn head(&self, n: usize) -> &[u8] {
+        let bytes: &[u8] = match self {
+            BodyStore::Memory(b) => b,
+            BodyStore::Spilled { head, .. } => head,
+        };
+        &bytes[..bytes.len().min(n)]
+    }
+
+    /// 落盘文件路径；仅 Spilled 有。
+    pub fn path(&self) -> Option<&Path> {
+        match self {
+            BodyStore::Memory(_) => None,
+            BodyStore::Spilled { file, .. } => Some(file.path()),
+        }
+    }
+}
+
+/// 接收端：先进内存，超过阈值时把已收内容写入临时文件并继续追加。
+enum Sink {
+    Memory(BytesMut),
+    Disk {
+        file: tokio::fs::File,
+        guard: SpillFile,
+        head: Vec<u8>,
+        len: u64,
+    },
+}
+
+fn spill_err(e: std::io::Error) -> RequestError {
+    RequestError::Spill(e.to_string())
+}
+
+impl Sink {
+    fn with_capacity(expected: Option<u64>, threshold: u64) -> Sink {
+        Sink::Memory(BytesMut::with_capacity(
+            expected.unwrap_or(0).min(threshold) as usize,
+        ))
+    }
+
+    fn len(&self) -> u64 {
+        match self {
+            Sink::Memory(buf) => buf.len() as u64,
+            Sink::Disk { len, .. } => *len,
+        }
+    }
+
+    async fn push(&mut self, chunk: &[u8], threshold: u64) -> Result<(), RequestError> {
+        let must_spill = matches!(
+            self,
+            Sink::Memory(buf) if (buf.len() + chunk.len()) as u64 > threshold
+        );
+        if must_spill {
+            let Sink::Memory(buf) = std::mem::replace(self, Sink::Memory(BytesMut::new())) else {
+                unreachable!("checked above");
+            };
+            let (guard, file) = SpillFile::create().map_err(spill_err)?;
+            let mut file = tokio::fs::File::from_std(file);
+            file.write_all(&buf).await.map_err(spill_err)?;
+            let head = buf[..buf.len().min(HEAD_BYTES)].to_vec();
+            *self = Sink::Disk {
+                file,
+                guard,
+                head,
+                len: buf.len() as u64,
+            };
+        }
+        match self {
+            Sink::Memory(buf) => buf.extend_from_slice(chunk),
+            Sink::Disk {
+                file, head, len, ..
+            } => {
+                file.write_all(chunk).await.map_err(spill_err)?;
+                if head.len() < HEAD_BYTES {
+                    let take = chunk.len().min(HEAD_BYTES - head.len());
+                    head.extend_from_slice(&chunk[..take]);
+                }
+                *len += chunk.len() as u64;
+            }
+        }
+        Ok(())
+    }
+
+    async fn finish(self) -> Result<BodyStore, RequestError> {
+        match self {
+            Sink::Memory(buf) => Ok(BodyStore::Memory(buf.freeze())),
+            Sink::Disk {
+                mut file,
+                guard,
+                head,
+                len,
+            } => {
+                file.flush().await.map_err(spill_err)?;
+                drop(file);
+                Ok(BodyStore::Spilled {
+                    file: Arc::new(guard),
+                    len,
+                    head: head.into(),
+                })
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct HttpResponse {
+    pub meta: ResponseMeta,
+    pub body: BodyStore,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Progress {
+    pub received: u64,
+    pub total: Option<u64>,
+    pub elapsed: Duration,
+}
+
+/// 发送期间回流给 UI 的事件。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamEvent {
+    /// 响应头已到达。UI 据 `content_type` 决定是否进入流式展示（SSE）。
+    Head {
+        status: u16,
+        content_type: Option<String>,
+    },
+    /// 字节进度：节流到 ≤ 30 Hz、`try_send` 可丢。
+    Progress(Progress),
+    /// SSE 响应的 body 分片：逐块转发、不节流不丢弃（丢块会破坏事件解析）。
+    /// 非 SSE 响应不发送此事件——大响应逐块过通道只是白拷贝。
+    Chunk(bytes::Bytes),
+}
+
+/// 默认设置的 client（测试与启动兜底）。
+pub fn build_client() -> Client {
+    build_client_with(&RequestSettings::default())
+}
+
+/// 按设置构建 reqwest client。设置改动后整个 client 要重建：超时、跳转策略与 TLS 校验
+/// 都是 builder 级别的选项。`timeout_secs == 0` 表示不设总超时（连接超时仍然固定 10 s）。
+pub fn build_client_with(settings: &RequestSettings) -> Client {
+    build_client_tuned(settings, |b| b)
+}
+
+/// `build_client_with` 的可加料版本：`tune` 负责按 HTTP 版本偏好动 ALPN。
+fn build_client_tuned(
+    settings: &RequestSettings,
+    tune: impl FnOnce(reqwest::ClientBuilder) -> reqwest::ClientBuilder,
+) -> Client {
+    let redirect = if settings.follow_redirects {
+        reqwest::redirect::Policy::limited(settings.max_redirects as usize)
+    } else {
+        reqwest::redirect::Policy::none()
+    };
+    let disabled = &settings.disabled_default_headers;
+    let mut defaults = HeaderMap::new();
+    for (key, value) in DEFAULT_HEADERS {
+        if !default_header_enabled(disabled, key) {
+            continue;
+        }
+        // 常量表里的键值都是合法的，解析不出来只可能是改常量时写错了
+        let name = HeaderName::from_bytes(key.as_bytes()).expect("default header name");
+        let value = HeaderValue::from_static(value);
+        defaults.insert(name, value);
+    }
+    // 关掉 Accept-Encoding 光是「不发这个头」没有用：解压中间件会在请求缺该头时
+    // 自动补上。要真的拿到原始压缩字节，得连自动解压一起关。
+    let decompress = default_header_enabled(disabled, ACCEPT_ENCODING_KEY);
+
+    let mut builder = Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .default_headers(defaults)
+        .gzip(decompress)
+        .brotli(decompress)
+        .zstd(decompress)
+        .redirect(redirect)
+        // verify_tls 默认打开（安全默认）；关闭是设置里的显式选项，服务于本地
+        // 自签名接口调试——这是 HTTP 调试工具的刚需，与 curl -k / Postman 的
+        // 对应开关同类。CodeQL 的 rust/disabled-certificate-check 会指到这一行，
+        // 属于对该功能本身的告警，不是默认值配置错误。
+        .danger_accept_invalid_certs(!settings.verify_tls)
+        // 把对端证书塞进响应的 extensions；不开的话 TlsInfo 根本不会被记录，
+        // 「证书」页签也就无从谈起
+        .tls_info(true);
+    if settings.timeout_secs > 0 {
+        builder = builder.timeout(Duration::from_secs(settings.timeout_secs));
+    }
+    tune(builder).build().expect("reqwest client")
+}
+
+/// 三个 HTTP 版本偏好各一个 client。
+///
+/// 走多 client 而不是 per-request 参数，是因为版本由 ALPN 协商决定，只能在
+/// builder 级定死；`RequestBuilder::version()` 只是断言，协商不上就直接报错。
+/// `Client` 内部是 Arc、连接池按需建立，闲着的那两个几乎不占资源。
+#[derive(Clone)]
+pub struct HttpClients {
+    auto: Client,
+    http1: Client,
+    http2: Client,
+}
+
+impl HttpClients {
+    pub fn get(&self, pref: HttpVersionPref) -> &Client {
+        match pref {
+            HttpVersionPref::Auto => &self.auto,
+            HttpVersionPref::Http1 => &self.http1,
+            HttpVersionPref::Http2 => &self.http2,
+        }
+    }
+}
+
+/// 默认设置的一组 client（启动兜底）。
+pub fn build_clients() -> HttpClients {
+    build_clients_with(&RequestSettings::default())
+}
+
+pub fn build_clients_with(settings: &RequestSettings) -> HttpClients {
+    HttpClients {
+        auto: build_client_with(settings),
+        http1: build_client_tuned(settings, |b| b.http1_only()),
+        // 对 https 是「ALPN 只提供 h2」，对明文 http 则是 h2c prior knowledge——
+        // 后者多数服务端不支持，属于用户显式选 HTTP/2 的代价
+        http2: build_client_tuned(settings, |b| b.http2_prior_knowledge()),
+    }
+}
+
+/// 协商到的版本的展示名。`{:?}` 会把 h2 印成 "HTTP/2.0"，这里统一成通用叫法。
+fn version_label(version: reqwest::Version) -> String {
+    match version {
+        reqwest::Version::HTTP_09 => "HTTP/0.9".to_string(),
+        reqwest::Version::HTTP_10 => "HTTP/1.0".to_string(),
+        reqwest::Version::HTTP_11 => "HTTP/1.1".to_string(),
+        reqwest::Version::HTTP_2 => "HTTP/2".to_string(),
+        reqwest::Version::HTTP_3 => "HTTP/3".to_string(),
+        other => format!("{other:?}"),
+    }
+}
+
+pub fn prepare(draft: &RequestDraft) -> Result<HttpRequest, RequestError> {
+    let url = build_url(draft).map_err(|e| RequestError::InvalidUrl(e.to_string()))?;
+
+    let mut headers = Vec::new();
+    for h in draft
+        .headers
+        .iter()
+        .filter(|h| h.enabled && !h.key.trim().is_empty())
+    {
+        let key = h.key.trim();
+        let value = h.value.trim();
+        HeaderName::from_bytes(key.as_bytes())
+            .map_err(|_| RequestError::InvalidHeader(key.to_string()))?;
+        HeaderValue::from_str(value).map_err(|_| RequestError::InvalidHeader(key.to_string()))?;
+        headers.push((key.to_string(), value.to_string()));
+    }
+
+    let body = match &draft.body {
+        BodyKind::None => OutboundBody::Empty,
+        BodyKind::Raw { format, text } => OutboundBody::Bytes {
+            content_type: format.content_type().to_string(),
+            data: text.as_bytes().to_vec(),
+        },
+        BodyKind::FormData { fields } => {
+            let mut parts = Vec::new();
+            for f in fields.iter().filter(|f| f.enabled && !f.key.is_empty()) {
+                match &f.value {
+                    FormValue::Text { value } => parts.push(OutboundPart::Text {
+                        name: f.key.clone(),
+                        value: value.clone(),
+                    }),
+                    FormValue::File { path, content_type } => {
+                        if path.as_os_str().is_empty() {
+                            return Err(RequestError::FileBody(format!(
+                                "Field \"{}\" has no file selected",
+                                f.key
+                            )));
+                        }
+                        parts.push(OutboundPart::File {
+                            name: f.key.clone(),
+                            path: path.clone(),
+                            content_type: content_type.clone(),
+                        });
+                    }
+                }
+            }
+            OutboundBody::Multipart { parts }
+        }
+        BodyKind::FormUrlEncoded { fields } => {
+            let mut ser = url::form_urlencoded::Serializer::new(String::new());
+            for f in fields.iter().filter(|f| f.enabled && !f.key.is_empty()) {
+                ser.append_pair(&f.key, &f.value);
+            }
+            OutboundBody::Bytes {
+                content_type: "application/x-www-form-urlencoded".to_string(),
+                data: ser.finish().into_bytes(),
+            }
+        }
+        BodyKind::Binary { path, content_type } => {
+            if path.as_os_str().is_empty() {
+                return Err(RequestError::FileBody("No file selected".to_string()));
+            }
+            OutboundBody::File {
+                path: path.clone(),
+                content_type: content_type.clone(),
+            }
+        }
+    };
+
+    Ok(HttpRequest {
+        method: draft.method,
+        url,
+        headers,
+        body,
+    })
+}
+
+/// 按扩展名猜测文件 Body 的 Content-Type；未知类型用 application/octet-stream。
+pub fn guess_content_type(path: &Path) -> &'static str {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some("json") => "application/json",
+        Some("xml") => "application/xml",
+        Some("txt" | "log" | "md") => "text/plain",
+        Some("csv") => "text/csv",
+        Some("html" | "htm") => "text/html",
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("pdf") => "application/pdf",
+        Some("zip") => "application/zip",
+        _ => "application/octet-stream",
+    }
+}
+
+fn file_err(path: &Path, e: std::io::Error) -> RequestError {
+    RequestError::FileBody(format!("{}：{e}", path.display()))
+}
+
+fn part_err(field: &str, path: &Path, e: std::io::Error) -> RequestError {
+    RequestError::FileBody(format!("Field \"{field}\": {}: {e}", path.display()))
+}
+
+/// 打开待上传的文件，确认它是普通文件，返回句柄与字节数。
+///
+/// 先 stat 再 open：Windows 上 `File::open` 一个目录会直接失败（拒绝访问），
+/// 拿不到后续 `is_file()` 的判断机会，同一个误操作在三个平台会给出不同的错误。
+/// 「不是普通文件」包成 io::Error，交给 file_err / part_err 统一加路径与字段名前缀。
+async fn open_upload_file(path: &Path) -> std::io::Result<(tokio::fs::File, u64)> {
+    let meta = tokio::fs::metadata(path).await?;
+    if !meta.is_file() {
+        return Err(std::io::Error::other("Not a regular file"));
+    }
+    let file = tokio::fs::File::open(path).await?;
+    // 长度取自已打开的句柄而非上面那次 stat：两次调用之间文件可能被改写，
+    // Content-Length 与实际 body 不一致会让请求挂起或被服务端拒绝。
+    let len = file.metadata().await?.len();
+    Ok((file, len))
+}
+
+fn to_reqwest_method(m: Method) -> reqwest::Method {
+    match m {
+        Method::Get => reqwest::Method::GET,
+        Method::Post => reqwest::Method::POST,
+        Method::Put => reqwest::Method::PUT,
+        Method::Patch => reqwest::Method::PATCH,
+        Method::Delete => reqwest::Method::DELETE,
+        Method::Head => reqwest::Method::HEAD,
+        Method::Options => reqwest::Method::OPTIONS,
+    }
+}
+
+pub async fn execute(
+    client: &Client,
+    req: HttpRequest,
+    progress: Option<mpsc::Sender<StreamEvent>>,
+) -> Result<HttpResponse, RequestError> {
+    execute_with_threshold(client, req, progress, MAX_BODY_BYTES).await
+}
+
+/// `execute` 的参数化版本：`spill_threshold` 为驻留内存的字节上限（测试用小值触发落盘）。
+pub(crate) async fn execute_with_threshold(
+    client: &Client,
+    req: HttpRequest,
+    progress: Option<mpsc::Sender<StreamEvent>>,
+    spill_threshold: u64,
+) -> Result<HttpResponse, RequestError> {
+    let started = Instant::now();
+    let mut builder = client.request(to_reqwest_method(req.method), req.url.clone());
+
+    // multipart 的 Content-Type 含 boundary，只能由 reqwest 生成；reqwest 的 header() 是 append 语义，
+    // 不剔除用户自设的 Content-Type 会发出两个。
+    let is_multipart = matches!(req.body, OutboundBody::Multipart { .. });
+    let mut has_content_type = false;
+    for (k, v) in &req.headers {
+        if k.eq_ignore_ascii_case("content-type") {
+            if is_multipart {
+                continue;
+            }
+            has_content_type = true;
+        }
+        // Content-Length / Transfer-Encoding / Host 由 reqwest/hyper 根据实际 body 与连接
+        // 自行计算和设置；透传用户在这些头上填的值会导致长度不匹配或被 hyper 拒绝，因此丢弃。
+        if k.eq_ignore_ascii_case("content-length")
+            || k.eq_ignore_ascii_case("transfer-encoding")
+            || k.eq_ignore_ascii_case("host")
+        {
+            continue;
+        }
+        builder = builder.header(k.as_str(), v.as_str());
+    }
+    match req.body {
+        OutboundBody::Empty => {}
+        OutboundBody::Bytes { content_type, data } => {
+            if !has_content_type {
+                builder = builder.header(CONTENT_TYPE, content_type);
+            }
+            builder = builder.body(data);
+        }
+        OutboundBody::Multipart { parts } => {
+            // 字段名原样 UTF-8，与浏览器 / Postman 一致；默认 PathSegment 编码会变成 `name*=utf-8''…`，很多服务端不识别。
+            let mut form = reqwest::multipart::Form::new().percent_encode_noop();
+            for part in parts {
+                form = match part {
+                    OutboundPart::Text { name, value } => form.text(name, value),
+                    OutboundPart::File {
+                        name,
+                        path,
+                        content_type,
+                    } => {
+                        let (file, len) = open_upload_file(&path)
+                            .await
+                            .map_err(|e| part_err(&name, &path, e))?;
+                        let file_name = path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "file".to_string());
+                        let mime =
+                            content_type.unwrap_or_else(|| guess_content_type(&path).to_string());
+                        // 定长流式：每个 part 长度已知，Form 才能算出总长并带 Content-Length；
+                        // 用 Part::stream 会退化为 chunked，很多上传入口直接拒绝。
+                        let p = reqwest::multipart::Part::stream_with_length(
+                            reqwest::Body::from(file),
+                            len,
+                        )
+                        .file_name(file_name)
+                        .mime_str(&mime)
+                        .map_err(|e| {
+                            RequestError::FileBody(format!(
+                                "Field \"{name}\": invalid Content-Type: {e}"
+                            ))
+                        })?;
+                        form.part(name, p)
+                    }
+                };
+            }
+            // multipart() 自行设置含 boundary 的 Content-Type 与 Content-Length
+            builder = builder.multipart(form);
+        }
+        OutboundBody::File { path, content_type } => {
+            let (file, len) = open_upload_file(&path)
+                .await
+                .map_err(|e| file_err(&path, e))?;
+            if !has_content_type && let Some(ct) = content_type {
+                builder = builder.header(CONTENT_TYPE, ct);
+            }
+            // 流式 Body 本身不知道长度：显式给出 Content-Length，hyper 会尊重用户设置的该头并按定长发送
+            builder = builder
+                .header(CONTENT_LENGTH, len)
+                .body(reqwest::Body::from(file));
+        }
+    }
+
+    let resp = builder.send().await?;
+    let status = resp.status();
+    let headers: Vec<(String, String)> = resp
+        .headers()
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.to_string(),
+                String::from_utf8_lossy(v.as_bytes()).into_owned(),
+            )
+        })
+        .collect();
+    let content_type = resp
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let total = resp.content_length();
+    let http_version = Some(version_label(resp.version()));
+    // 主机名取最终 URL（跟随跳转之后），证书是跟这个主机握的手。
+    // extensions 必须在 bytes_stream() 消费掉 resp 之前读走。
+    let certificate = resp
+        .extensions()
+        .get::<reqwest::tls::TlsInfo>()
+        .and_then(|info| info.peer_certificate())
+        .and_then(|der| tls::inspect(der, resp.url().host_str().unwrap_or("")))
+        .map(Box::new);
+
+    if let Some(tx) = &progress {
+        let _ = tx
+            .send(StreamEvent::Head {
+                status: status.as_u16(),
+                content_type: content_type.clone(),
+            })
+            .await;
+    }
+    // SSE 逐块转发给 UI 边收边展示；用 send().await 而不是 try_send——事件流不能丢块，
+    // 而 SSE 分片小且到达频率低，背压到通道上限（接收端在主线程上很快排空）可以接受。
+    let forward_chunks = crate::sse::is_sse(content_type.as_deref());
+
+    let mut sink = Sink::with_capacity(total, spill_threshold);
+    let mut stream = resp.bytes_stream();
+    let mut last_report = Instant::now();
+    let mut ttfb = None;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        ttfb.get_or_insert_with(|| started.elapsed());
+        sink.push(&chunk, spill_threshold).await?;
+        if let Some(tx) = &progress {
+            if forward_chunks {
+                // 接收端被 drop（取消 / 重发）时发送失败：继续收完即可，错误不致命
+                let _ = tx.send(StreamEvent::Chunk(chunk)).await;
+            }
+            if last_report.elapsed() >= PROGRESS_INTERVAL {
+                let _ = tx.try_send(StreamEvent::Progress(Progress {
+                    received: sink.len(),
+                    total,
+                    elapsed: started.elapsed(),
+                }));
+                last_report = Instant::now();
+            }
+        }
+    }
+    let duration = started.elapsed();
+    if let Some(tx) = &progress {
+        let _ = tx.try_send(StreamEvent::Progress(Progress {
+            received: sink.len(),
+            total,
+            elapsed: duration,
+        }));
+    }
+
+    let body = sink.finish().await?;
+    Ok(HttpResponse {
+        meta: ResponseMeta {
+            status: status.as_u16(),
+            status_text: status.canonical_reason().unwrap_or("").to_string(),
+            headers,
+            duration,
+            ttfb,
+            body_len: body.len(),
+            content_type,
+            http_version,
+            certificate,
+        },
+        body,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::body::spill::HEAD_BYTES;
+    use crate::model::{BodyKind, FormField, FormValue, KeyValue, Method, RawFormat, RequestDraft};
+    use std::io::Write;
+    use std::path::PathBuf;
+    use wiremock::matchers::{
+        body_bytes, body_string, body_string_contains, header, header_regex, method, path,
+        query_param,
+    };
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn draft(m: Method, url: String) -> RequestDraft {
+        RequestDraft {
+            method: m,
+            url,
+            ..Default::default()
+        }
+    }
+
+    async fn run(d: &RequestDraft) -> Result<HttpResponse, RequestError> {
+        let client = build_client();
+        execute(&client, prepare(d)?, None).await
+    }
+
+    #[tokio::test]
+    async fn get_returns_status_headers_and_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/hello"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("hi")
+                    .insert_header("x-test", "1")
+                    .insert_header("content-type", "text/plain"),
+            )
+            .mount(&server)
+            .await;
+        let resp = run(&draft(Method::Get, format!("{}/hello", server.uri())))
+            .await
+            .unwrap();
+        assert_eq!(resp.meta.status, 200);
+        assert_eq!(resp.meta.status_text, "OK");
+        assert_eq!(resp.body.memory().unwrap(), b"hi");
+        assert_eq!(resp.meta.body_len, 2);
+        assert_eq!(resp.meta.content_type.as_deref(), Some("text/plain"));
+        assert!(
+            resp.meta
+                .headers
+                .iter()
+                .any(|(k, v)| k == "x-test" && v == "1")
+        );
+    }
+
+    #[tokio::test]
+    async fn redirects_are_followed_only_when_the_setting_says_so() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/old"))
+            .respond_with(ResponseTemplate::new(302).insert_header("location", "/new"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/new"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("moved"))
+            .mount(&server)
+            .await;
+        let d = draft(Method::Get, format!("{}/old", server.uri()));
+
+        let follow = build_client_with(&RequestSettings::default());
+        let resp = execute(&follow, prepare(&d).unwrap(), None).await.unwrap();
+        assert_eq!(resp.meta.status, 200);
+        assert_eq!(resp.body.memory().unwrap(), b"moved");
+
+        let stay = build_client_with(&RequestSettings {
+            follow_redirects: false,
+            ..Default::default()
+        });
+        let resp = execute(&stay, prepare(&d).unwrap(), None).await.unwrap();
+        assert_eq!(resp.meta.status, 302);
+    }
+
+    #[test]
+    fn every_settings_combination_builds_a_client() {
+        // 默认头的禁用清单也进来遍历一遍：关掉 Accept-Encoding 会连带改动
+        // gzip/brotli/zstd 三个 builder 开关，是这里唯一有分支的一维
+        let header_sets = [
+            Vec::new(),
+            vec!["user-agent".to_string()],
+            vec!["accept-encoding".to_string()],
+            DEFAULT_HEADERS
+                .iter()
+                .map(|(k, _)| k.to_ascii_lowercase())
+                .collect(),
+        ];
+        for timeout_secs in [0, 5] {
+            for follow_redirects in [true, false] {
+                for verify_tls in [true, false] {
+                    for disabled_default_headers in &header_sets {
+                        let _ = build_client_with(&RequestSettings {
+                            timeout_secs,
+                            follow_redirects,
+                            max_redirects: 3,
+                            verify_tls,
+                            disabled_default_headers: disabled_default_headers.clone(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn post_raw_json_sets_content_type_and_user_agent() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/items"))
+            .and(header("content-type", "application/json"))
+            .and(header("user-agent", USER_AGENT_VALUE))
+            .and(body_string(r#"{"a":1}"#))
+            .respond_with(ResponseTemplate::new(201))
+            .mount(&server)
+            .await;
+        let mut d = draft(Method::Post, format!("{}/items", server.uri()));
+        d.body = BodyKind::Raw {
+            format: RawFormat::Json,
+            text: r#"{"a":1}"#.into(),
+        };
+        assert_eq!(run(&d).await.unwrap().meta.status, 201);
+    }
+
+    /// 起一个照单全收的 server，按给定设置发一次 GET，返回它**实际收到**的请求头。
+    ///
+    /// 默认头是 client 级下发的，`prepare()` 产出的 `HttpRequest.headers` 里根本看不到，
+    /// 服务端这一侧是「少发 / 多发一个头」唯一可靠的观测点。
+    async fn sent_headers(settings: &RequestSettings, headers: Vec<KeyValue>) -> HeaderMap {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let mut d = draft(Method::Get, server.uri());
+        d.headers = headers;
+        let client = build_client_with(settings);
+        execute(&client, prepare(&d).unwrap(), None).await.unwrap();
+        server.received_requests().await.unwrap().remove(0).headers
+    }
+
+    #[tokio::test]
+    async fn default_headers_are_sent() {
+        let sent = sent_headers(&RequestSettings::default(), vec![]).await;
+        for (key, value) in DEFAULT_HEADERS {
+            assert_eq!(
+                sent.get(*key).map(|v| v.to_str().unwrap()),
+                Some(*value),
+                "默认头 {key} 没有原样发出去"
+            );
+        }
+    }
+
+    /// 请求自己填的同名 header 必须赢：reqwest 是以 vacant-entry 语义合入 client 级
+    /// 默认头的，这条钉住那个语义——一旦上游改成 append，服务端会收到两个 Accept。
+    #[tokio::test]
+    async fn request_header_overrides_default_header() {
+        let sent = sent_headers(
+            &RequestSettings::default(),
+            vec![KeyValue::new("Accept", "application/json")],
+        )
+        .await;
+        assert_eq!(sent["accept"], "application/json");
+        assert_eq!(sent.get_all("accept").iter().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn disabled_default_header_is_not_sent() {
+        let settings = RequestSettings {
+            disabled_default_headers: vec!["user-agent".into()],
+            ..Default::default()
+        };
+        let sent = sent_headers(&settings, vec![]).await;
+        assert!(sent.get("user-agent").is_none());
+        // 只关掉点名的那一条，其余照发
+        assert_eq!(sent["accept"], "*/*");
+    }
+
+    /// 关掉 Accept-Encoding 不能只是「少发一个头」：解压中间件会在请求缺该头时自己补上，
+    /// 那样开关等于没按。所以这一条必须连自动解压一起关，用户拿到的才是原始压缩字节。
+    #[tokio::test]
+    async fn disabling_accept_encoding_also_disables_decompression() {
+        let server = MockServer::start().await;
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(b"hello gzip").unwrap();
+        let gz = enc.finish().unwrap();
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(gz.clone())
+                    .insert_header("content-encoding", "gzip"),
+            )
+            .mount(&server)
+            .await;
+
+        let settings = RequestSettings {
+            disabled_default_headers: vec!["accept-encoding".into()],
+            ..Default::default()
+        };
+        let client = build_client_with(&settings);
+        let d = draft(Method::Get, server.uri());
+        let resp = execute(&client, prepare(&d).unwrap(), None).await.unwrap();
+
+        assert_eq!(resp.body.memory().unwrap(), &gz[..]);
+        let sent = server.received_requests().await.unwrap().remove(0).headers;
+        assert!(sent.get("accept-encoding").is_none());
+    }
+
+    /// Content-Length / Transfer-Encoding / Host 由 reqwest/hyper 自行计算，用户手填的值
+    /// 不得透传：服务端按真实 body 长度（3 字节）匹配，若用户的 "1" 被透传就会请求失败。
+    #[tokio::test]
+    async fn user_content_length_header_is_not_forwarded() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(header("content-length", "3"))
+            .and(body_string("abc"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let mut d = draft(Method::Post, server.uri());
+        d.headers = vec![KeyValue::new("Content-Length", "1")];
+        d.body = BodyKind::Raw {
+            format: RawFormat::Text,
+            text: "abc".into(),
+        };
+        assert_eq!(run(&d).await.unwrap().meta.status, 200);
+    }
+
+    #[tokio::test]
+    async fn user_content_type_overrides_default() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(header("content-type", "text/plain"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let mut d = draft(Method::Post, server.uri());
+        d.headers = vec![KeyValue::new("Content-Type", "text/plain")];
+        d.body = BodyKind::Raw {
+            format: RawFormat::Json,
+            text: "{}".into(),
+        };
+        assert_eq!(run(&d).await.unwrap().meta.status, 200);
+    }
+
+    #[tokio::test]
+    async fn form_urlencoded_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(header("content-type", "application/x-www-form-urlencoded"))
+            .and(body_string("a=1&b=x+y"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let mut d = draft(Method::Post, server.uri());
+        d.body = BodyKind::FormUrlEncoded {
+            fields: vec![
+                KeyValue::new("a", "1"),
+                KeyValue::new("b", "x y"),
+                KeyValue {
+                    enabled: false,
+                    ..KeyValue::new("c", "off")
+                },
+            ],
+        };
+        assert_eq!(run(&d).await.unwrap().meta.status, 200);
+    }
+
+    #[tokio::test]
+    async fn path_and_query_params_are_applied() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/users/7"))
+            .and(query_param("page", "2"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let mut d = draft(Method::Get, format!("{}/users/{{id}}", server.uri()));
+        d.path_params = vec![KeyValue::new("id", "7")];
+        d.params = vec![KeyValue::new("page", "2")];
+        assert_eq!(run(&d).await.unwrap().meta.status, 200);
+    }
+
+    #[tokio::test]
+    async fn gzip_is_transparently_decoded() {
+        let server = MockServer::start().await;
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(b"hello gzip").unwrap();
+        let gz = enc.finish().unwrap();
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(gz)
+                    .insert_header("content-encoding", "gzip"),
+            )
+            .mount(&server)
+            .await;
+        let resp = run(&draft(Method::Get, server.uri())).await.unwrap();
+        assert_eq!(resp.body.memory().unwrap(), b"hello gzip");
+    }
+
+    #[tokio::test]
+    async fn progress_reports_final_total() {
+        let server = MockServer::start().await;
+        let size = 1usize << 20;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b'a'; size]))
+            .mount(&server)
+            .await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let client = build_client();
+        let resp = execute(
+            &client,
+            prepare(&draft(Method::Get, server.uri())).unwrap(),
+            Some(tx),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.body.len(), size as u64);
+        let mut head = None;
+        let mut last = None;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                StreamEvent::Head { status, .. } => head = Some(status),
+                StreamEvent::Progress(p) => last = Some(p),
+                StreamEvent::Chunk(_) => panic!("non-SSE responses must not forward chunks"),
+            }
+        }
+        assert_eq!(head, Some(200), "head event arrives before progress");
+        let last = last.expect("at least one progress event");
+        assert_eq!(last.received, size as u64);
+        assert!(resp.meta.ttfb.is_some());
+        assert!(resp.meta.ttfb.unwrap() <= resp.meta.duration);
+    }
+
+    /// SSE 响应逐块转发 body 分片，且分片按序拼回完整响应体。
+    #[tokio::test]
+    async fn sse_responses_forward_chunks() {
+        let server = MockServer::start().await;
+        let body = "data: hello\n\ndata: [DONE]\n\n";
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_bytes(body.as_bytes().to_vec()),
+            )
+            .mount(&server)
+            .await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let client = build_client();
+        let resp = execute(
+            &client,
+            prepare(&draft(Method::Get, server.uri())).unwrap(),
+            Some(tx),
+        )
+        .await
+        .unwrap();
+        let mut chunks: Vec<u8> = Vec::new();
+        let mut saw_head = false;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                StreamEvent::Head {
+                    status,
+                    content_type,
+                } => {
+                    saw_head = true;
+                    assert_eq!(status, 200);
+                    assert!(crate::sse::is_sse(content_type.as_deref()));
+                }
+                StreamEvent::Chunk(c) => chunks.extend_from_slice(&c),
+                StreamEvent::Progress(_) => {}
+            }
+        }
+        assert!(saw_head);
+        assert_eq!(chunks, body.as_bytes(), "chunks must reassemble the body");
+        assert_eq!(resp.body.memory().unwrap(), body.as_bytes());
+    }
+
+    async fn run_with_threshold(d: &RequestDraft, threshold: u64) -> HttpResponse {
+        let client = build_client();
+        execute_with_threshold(&client, prepare(d).unwrap(), None, threshold)
+            .await
+            .unwrap()
+    }
+
+    async fn serve_bytes(body: Vec<u8>) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn body_at_or_below_threshold_stays_in_memory() {
+        for size in [1023usize, 1024] {
+            let server = serve_bytes(vec![b'a'; size]).await;
+            let resp = run_with_threshold(&draft(Method::Get, server.uri()), 1024).await;
+            assert!(!resp.body.is_spilled(), "{size} bytes must stay in memory");
+            assert_eq!(resp.body.memory().unwrap().len(), size);
+            assert_eq!(resp.body.path(), None);
+            assert_eq!(resp.meta.body_len, size as u64);
+        }
+    }
+
+    #[tokio::test]
+    async fn body_over_threshold_is_spilled_to_disk_with_head() {
+        let mut body = vec![b'a'; 1025];
+        body[0] = b'{';
+        body[1024] = b'z';
+        let server = serve_bytes(body.clone()).await;
+        let resp = run_with_threshold(&draft(Method::Get, server.uri()), 1024).await;
+        assert!(resp.body.is_spilled());
+        assert!(resp.body.memory().is_none());
+        assert_eq!(resp.body.len(), 1025);
+        assert_eq!(resp.meta.body_len, 1025);
+        assert_eq!(resp.body.head(4), b"{aaa");
+        // 1025 < HEAD_BYTES：head 就是全文
+        assert_eq!(resp.body.head(usize::MAX), &body[..]);
+        let path = resp.body.path().unwrap().to_path_buf();
+        assert_eq!(std::fs::read(&path).unwrap(), body);
+        drop(resp);
+        assert!(
+            !path.exists(),
+            "spill file must be deleted when the last BodyStore is dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn spilled_head_is_capped_at_head_bytes() {
+        let size = HEAD_BYTES + 1;
+        let server = serve_bytes(vec![b'b'; size]).await;
+        let resp = run_with_threshold(&draft(Method::Get, server.uri()), 4096).await;
+        assert!(resp.body.is_spilled());
+        assert_eq!(resp.body.head(usize::MAX).len(), HEAD_BYTES);
+        assert_eq!(resp.body.len(), size as u64);
+        assert_eq!(
+            std::fs::metadata(resp.body.path().unwrap()).unwrap().len(),
+            size as u64
+        );
+    }
+
+    #[tokio::test]
+    async fn chunked_gzip_body_over_threshold_is_spilled() {
+        // gzip 响应无可用 Content-Length（reqwest 解压后 content_length() 为 None），走流式累积中的落盘分支
+        let server = MockServer::start().await;
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(&vec![b'a'; 4096]).unwrap();
+        let gz = enc.finish().unwrap();
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(gz)
+                    .insert_header("content-encoding", "gzip"),
+            )
+            .mount(&server)
+            .await;
+        let resp = run_with_threshold(&draft(Method::Get, server.uri()), 512).await;
+        assert!(resp.body.is_spilled());
+        assert_eq!(resp.body.len(), 4096);
+        assert_eq!(resp.body.head(usize::MAX), &vec![b'a'; 4096][..]);
+    }
+
+    #[tokio::test]
+    async fn cloned_body_stores_share_one_spill_file() {
+        let server = serve_bytes(vec![b'c'; 2048]).await;
+        let resp = run_with_threshold(&draft(Method::Get, server.uri()), 1024).await;
+        let path = resp.body.path().unwrap().to_path_buf();
+        let second = resp.body.clone();
+        drop(resp);
+        assert!(path.exists(), "still referenced by the clone");
+        drop(second);
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn progress_reports_received_bytes_for_spilled_bodies() {
+        let server = serve_bytes(vec![b'd'; 8192]).await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let client = build_client();
+        let resp = execute_with_threshold(
+            &client,
+            prepare(&draft(Method::Get, server.uri())).unwrap(),
+            Some(tx),
+            1024,
+        )
+        .await
+        .unwrap();
+        assert!(resp.body.is_spilled());
+        let mut last = None;
+        while let Ok(ev) = rx.try_recv() {
+            if let StreamEvent::Progress(p) = ev {
+                last = Some(p);
+            }
+        }
+        assert_eq!(last.expect("progress").received, 8192);
+    }
+
+    #[tokio::test]
+    async fn connection_refused_is_classified() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let err = run(&draft(Method::Get, format!("http://127.0.0.1:{port}/")))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RequestError::ConnectionRefused(_)), "{err:?}");
+    }
+
+    /// 回归：reqwest 会把 ` for url (<url>)` 拼进顶层错误文本，URL 里的
+    /// "dns"/"tls"/"resolve" 等字样不得影响分类。
+    #[tokio::test]
+    async fn url_keywords_do_not_affect_classification() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let err = run(&draft(
+            Method::Get,
+            format!("http://127.0.0.1:{port}/dns/tls/resolve"),
+        ))
+        .await
+        .unwrap_err();
+        assert!(matches!(err, RequestError::ConnectionRefused(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn dns_failure_is_classified() {
+        // 某些本地代理（如 Clash 的 fake-ip 模式）会把任意域名解析到 198.18.0.0/15，
+        // 此时无法测到真正的 DNS 失败，跳过而不是误报。
+        if tokio::net::lookup_host("nonexistent.invalid:80")
+            .await
+            .is_ok()
+        {
+            eprintln!("skipped: environment resolves nonexistent.invalid (fake-ip DNS?)");
+            return;
+        }
+        let err = run(&draft(Method::Get, "http://nonexistent.invalid/".into()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RequestError::Dns(_)), "{err:?}");
+    }
+
+    #[test]
+    fn prepare_rejects_invalid_header_and_url() {
+        let mut d = draft(Method::Get, "https://x.com".into());
+        d.headers = vec![KeyValue::new("bad header", "x")];
+        assert!(matches!(prepare(&d), Err(RequestError::InvalidHeader(_))));
+        let d = draft(Method::Get, "".into());
+        assert!(matches!(prepare(&d), Err(RequestError::InvalidUrl(_))));
+    }
+
+    #[test]
+    fn prepare_skips_disabled_and_blank_headers() {
+        let mut d = draft(Method::Get, "https://x.com".into());
+        d.headers = vec![
+            KeyValue::new("X-A", "1"),
+            KeyValue {
+                enabled: false,
+                ..KeyValue::new("X-B", "2")
+            },
+            KeyValue::new("  ", ""),
+        ];
+        let req = prepare(&d).unwrap();
+        assert_eq!(req.headers, vec![("X-A".to_string(), "1".to_string())]);
+    }
+
+    /// 同一测试二进制内的用例并行执行且共用此目录：`name` 必须每个用例唯一，
+    /// 否则一个用例 `fs::write` 截断重写时另一个正在流式读同一文件，会出现 body 比 Content-Length 短的偶发失败。
+    fn temp_upload_file(name: &str, payload: &[u8]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("germal-filebody-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, payload).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn file_body_is_streamed_with_content_length_and_type() {
+        // 300 KB：大于 ReaderStream 的单块（4 KiB），保证走多块流式路径
+        let payload: Vec<u8> = (0..300_000u32).map(|i| b'0' + (i % 10) as u8).collect();
+        let path = temp_upload_file("upload.json", &payload);
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(header("content-type", "application/json"))
+            .and(header("content-length", "300000"))
+            .and(body_bytes(payload.clone()))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let mut d = draft(Method::Put, server.uri());
+        d.body = BodyKind::Binary {
+            path: path.clone(),
+            content_type: Some(guess_content_type(&path).to_string()),
+        };
+        assert_eq!(run(&d).await.unwrap().meta.status, 200);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn user_content_type_overrides_file_guess() {
+        let path = temp_upload_file("upload.bin", b"xyz");
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(header("content-type", "text/plain"))
+            .and(body_bytes(b"xyz".to_vec()))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let mut d = draft(Method::Post, server.uri());
+        d.headers = vec![KeyValue::new("Content-Type", "text/plain")];
+        d.body = BodyKind::Binary {
+            path: path.clone(),
+            content_type: Some("application/octet-stream".into()),
+        };
+        assert_eq!(run(&d).await.unwrap().meta.status, 200);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn directory_as_file_body_is_reported_as_file_body_error() {
+        let dir = std::env::temp_dir().join(format!("germal-filebody-dir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut d = draft(Method::Post, "http://127.0.0.1:1/".into());
+        d.body = BodyKind::Binary {
+            path: dir.clone(),
+            content_type: None,
+        };
+        let err = run(&d).await.unwrap_err();
+        assert!(matches!(err, RequestError::FileBody(_)), "{err:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn missing_file_is_reported_as_file_body_error() {
+        let mut d = draft(Method::Post, "http://127.0.0.1:1/".into());
+        d.body = BodyKind::Binary {
+            path: "/nonexistent/germal/upload.bin".into(),
+            content_type: None,
+        };
+        let err = run(&d).await.unwrap_err();
+        assert!(matches!(err, RequestError::FileBody(_)), "{err:?}");
+        assert!(err.to_string().contains("upload.bin"));
+    }
+
+    #[test]
+    fn prepare_rejects_empty_file_path() {
+        let mut d = draft(Method::Post, "https://x.com".into());
+        d.body = BodyKind::Binary {
+            path: std::path::PathBuf::new(),
+            content_type: None,
+        };
+        assert!(matches!(prepare(&d), Err(RequestError::FileBody(_))));
+    }
+
+    #[test]
+    fn content_type_is_guessed_from_extension() {
+        use std::path::Path;
+        assert_eq!(guess_content_type(Path::new("a.JSON")), "application/json");
+        assert_eq!(guess_content_type(Path::new("a.xml")), "application/xml");
+        assert_eq!(guess_content_type(Path::new("a.txt")), "text/plain");
+        assert_eq!(guess_content_type(Path::new("a.png")), "image/png");
+        assert_eq!(guess_content_type(Path::new("a.jpeg")), "image/jpeg");
+        assert_eq!(
+            guess_content_type(Path::new("a")),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            guess_content_type(Path::new("a.weird")),
+            "application/octet-stream"
+        );
+    }
+
+    /// Content-Type 恰好一个且是 multipart；有 Content-Length、无 Transfer-Encoding（定长而非 chunked）。
+    struct MultipartFixedLength;
+    impl wiremock::Match for MultipartFixedLength {
+        fn matches(&self, req: &wiremock::Request) -> bool {
+            let cts: Vec<_> = req.headers.get_all("content-type").iter().collect();
+            cts.len() == 1
+                && cts[0]
+                    .to_str()
+                    .map(|v| v.starts_with("multipart/form-data; boundary="))
+                    .unwrap_or(false)
+                && req.headers.contains_key("content-length")
+                && !req.headers.contains_key("transfer-encoding")
+        }
+    }
+
+    #[tokio::test]
+    async fn form_data_is_sent_as_fixed_length_multipart() {
+        // 300 KB：大于 ReaderStream 单块，保证文件 part 走多块流式路径
+        let payload: Vec<u8> = (0..300_000u32).map(|i| b'0' + (i % 10) as u8).collect();
+        let path = temp_upload_file("form-upload.json", &payload);
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(MultipartFixedLength)
+            .and(body_string_contains("name=\"note\""))
+            .and(body_string_contains("hi there"))
+            .and(body_string_contains(
+                "name=\"doc\"; filename=\"form-upload.json\"",
+            ))
+            .and(body_string_contains("Content-Type: application/json"))
+            .and(body_string_contains(
+                std::str::from_utf8(&payload[..4096]).unwrap(),
+            ))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let mut d = draft(Method::Post, server.uri());
+        d.body = BodyKind::FormData {
+            fields: vec![
+                FormField::text("note", "hi there"),
+                FormField::file("doc", path.clone()),
+            ],
+        };
+        assert_eq!(run(&d).await.unwrap().meta.status, 200);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn form_data_ignores_user_content_type_header() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(MultipartFixedLength)
+            .and(header("x-keep", "1"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let mut d = draft(Method::Post, server.uri());
+        d.headers = vec![
+            KeyValue::new("Content-Type", "text/plain"),
+            KeyValue::new("X-Keep", "1"),
+        ];
+        d.body = BodyKind::FormData {
+            fields: vec![FormField::text("a", "1")],
+        };
+        assert_eq!(run(&d).await.unwrap().meta.status, 200);
+    }
+
+    #[tokio::test]
+    async fn empty_form_data_still_sends_multipart() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(header_regex(
+                "content-type",
+                "^multipart/form-data; boundary=",
+            ))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let mut d = draft(Method::Post, server.uri());
+        d.body = BodyKind::FormData { fields: vec![] };
+        assert_eq!(run(&d).await.unwrap().meta.status, 204);
+    }
+
+    #[tokio::test]
+    async fn form_data_sends_non_ascii_field_names_raw() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("name=\"用户名\""))
+            .and(body_string_contains("小明"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let mut d = draft(Method::Post, server.uri());
+        d.body = BodyKind::FormData {
+            fields: vec![FormField::text("用户名", "小明")],
+        };
+        assert_eq!(run(&d).await.unwrap().meta.status, 200);
+    }
+
+    #[tokio::test]
+    async fn form_file_part_uses_explicit_content_type_when_given() {
+        let path = temp_upload_file("data.json", b"a,b\n1,2\n");
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("filename=\"data.json\""))
+            .and(body_string_contains("Content-Type: text/csv"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let mut d = draft(Method::Post, server.uri());
+        d.body = BodyKind::FormData {
+            fields: vec![FormField {
+                value: FormValue::File {
+                    path: path.clone(),
+                    content_type: Some("text/csv".into()),
+                },
+                ..FormField::file("f", PathBuf::new())
+            }],
+        };
+        assert_eq!(run(&d).await.unwrap().meta.status, 200);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn prepare_skips_disabled_and_unnamed_form_fields() {
+        let mut d = draft(Method::Post, "https://x.com".into());
+        d.body = BodyKind::FormData {
+            fields: vec![
+                FormField::text("a", "1"),
+                FormField {
+                    enabled: false,
+                    ..FormField::text("b", "2")
+                },
+                FormField::text("", "3"),
+                FormField {
+                    enabled: false,
+                    ..FormField::file("f", PathBuf::new())
+                },
+            ],
+        };
+        let req = prepare(&d).unwrap();
+        assert_eq!(
+            req.body,
+            OutboundBody::Multipart {
+                parts: vec![OutboundPart::Text {
+                    name: "a".into(),
+                    value: "1".into()
+                }]
+            }
+        );
+    }
+
+    #[test]
+    fn prepare_rejects_form_file_without_path_and_names_the_field() {
+        let mut d = draft(Method::Post, "https://x.com".into());
+        d.body = BodyKind::FormData {
+            fields: vec![FormField::file("avatar", PathBuf::new())],
+        };
+        let err = prepare(&d).unwrap_err();
+        assert!(matches!(err, RequestError::FileBody(_)), "{err:?}");
+        assert!(
+            err.to_string()
+                .contains("Field \"avatar\" has no file selected"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_form_file_is_reported_with_field_name() {
+        let mut d = draft(Method::Post, "http://127.0.0.1:1/".into());
+        d.body = BodyKind::FormData {
+            fields: vec![FormField::file(
+                "doc",
+                "/nonexistent/germal/report.pdf".into(),
+            )],
+        };
+        let err = run(&d).await.unwrap_err();
+        assert!(matches!(err, RequestError::FileBody(_)), "{err:?}");
+        let msg = err.to_string();
+        assert!(msg.contains("doc") && msg.contains("report.pdf"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn directory_as_form_file_is_reported_as_file_body_error() {
+        let dir = std::env::temp_dir().join(format!("germal-formdir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut d = draft(Method::Post, "http://127.0.0.1:1/".into());
+        d.body = BodyKind::FormData {
+            fields: vec![FormField::file("doc", dir.clone())],
+        };
+        let err = run(&d).await.unwrap_err();
+        assert!(err.to_string().contains("Not a regular file"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

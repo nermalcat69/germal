@@ -1,0 +1,30 @@
+[package]
+name = "germal-recorder"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "germal-rec"
+path = "src/main.rs"
+
+[dependencies]
+germal-core.workspace = true
+chromiumoxide = "0.9"
+rusqlite = { version = "0.40", features = ["bundled"] }
+clap = { version = "4", features = ["derive"] }
+tokio = { workspace = true, features = ["signal"] }
+futures.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+url.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+ulid.workspace = true
+aes-gcm = "0.10"
+argon2 = "0.5"
+zstd = "0.13"
+rpassword = "7"
+tempfile.workspace = true

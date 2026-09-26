@@ -1,0 +1,76 @@
+# 依赖许可证门禁。Germal 以 Apache-2.0 分发，因此依赖图内不得混入
+# GPL/AGPL/LGPL 等强 copyleft 许可证。
+#
+#   cargo deny check licenses
+#
+# CI 会跑这项检查；本地提交前也建议手动跑一次。
+
+[graph]
+# 三个目标平台都要覆盖，否则 Windows/Linux 专属依赖会被漏掉
+# （例如 MPL-2.0 的 dwrote 只在 Windows 上出现）
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+]
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+# allow 列表里未被用到的条目不必报警——OR 表达式常常只命中其中一项
+unused-allowed-license = "allow"
+
+# 与 Apache-2.0 分发相容的宽松许可证白名单。
+# 新增条目前请先确认它不是 copyleft。
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MIT-0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "0BSD",
+    "Zlib",
+    "BSL-1.0",
+    "CC0-1.0",
+    "Unlicense",
+    "Unicode-3.0",
+    "NCSA",
+    "CDLA-Permissive-2.0",
+    "bzip2-1.0.6",
+]
+
+# ---------------------------------------------------------------------------
+# 例外 1：MPL-2.0（弱 copyleft，文件级）
+#
+# MPL-2.0 只要求「被修改的 MPL 源文件」保持开源，不感染同一作品中的其他代码，
+# 与 Apache-2.0 可以合法共存。我们不修改这些 crate，因此只需在 THIRD-PARTY.md
+# 中列明出处即可。
+# ---------------------------------------------------------------------------
+[[licenses.exceptions]]
+name = "option-ext"   # dirs-sys -> dirs/directories，会链入二进制
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+name = "dwrote"       # 仅 Windows，font-kit 的 DirectWrite 后端
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+name = "cbindgen"     # build-dependency，仅构建期运行，不进入分发产物
+allow = ["MPL-2.0"]
+
+# gpui 改为 crates.io 的 gpui-pre 系列（GPUI Kit 0.6）后，原先经 zed git 源传入的
+# GPL 许可证 zlog / ztracing 例外、以及缺 license 字段的 clarify 条目都不再需要：
+# gpui-pre-zlog / gpui-pre-ztracing 在 crates.io 上均声明为 Apache-2.0。
+
+[bans]
+multiple-versions = "allow"
+
+[advisories]
+version = 2
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"    # 依赖图里已没有 git 源（gpui-updater 已 vendor）

@@ -1,0 +1,203 @@
+name: Release
+
+# 打包 macOS（arm64 / x64）、Linux（x64 / arm64）、Windows（x64 / arm64）。
+#
+# 触发方式（推送到 main 不会触发）：
+#   - 手动：Actions → Release → Run workflow，只构建并上传为工作流产物，不建 Release；
+#   - 打 tag：推送 `vX.Y.Z`（要与 Cargo.toml 的版本一致）时，构建完成后会建一个「草稿」Release，
+#     需要在 GitHub 页面上手动点 Publish 才会公开。
+#
+# 可选 secrets（都没有也能跑，只是产物未签名）：
+#   APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD / APPLE_SIGNING_IDENTITY   macOS Developer ID 签名
+#   APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID                                 macOS 公证
+#   MINISIGN_SECRET_KEY                                                       给每个资产出 .minisig（应用内更新器验签用）
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  verify-version:
+    name: verify tag matches Cargo.toml
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          want="${GITHUB_REF_NAME#v}"
+          have="$(awk -F'"' '/^\[/{w=($0=="[workspace.package]")} w&&/^version = "/{print $2; exit}' Cargo.toml)"
+          [ "$want" = "$have" ] || { echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $have"; exit 1; }
+          lock="$(grep -A1 -Fx 'name = "germal-app"' Cargo.lock | sed -n 's/^version = "\(.*\)"/\1/p')"
+          [ "$want" = "$lock" ] || { echo "::error::Cargo.lock has germal-app $lock, expected $want (run scripts/release.sh)"; exit 1; }
+
+  macos:
+    name: macOS ${{ matrix.arch }}
+    needs: [verify-version]
+    # verify-version 在手动触发时被跳过，此时照常构建
+    if: ${{ !cancelled() && (needs.verify-version.result == 'success' || needs.verify-version.result == 'skipped') }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: arm64, runner: macos-14, target: aarch64-apple-darwin }
+          - { arch: x64, runner: macos-15-intel, target: x86_64-apple-darwin }
+    env:
+      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Import signing certificate
+        if: env.APPLE_CERTIFICATE != ''
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: scripts/ci/macos-keychain.sh import
+
+      - name: Bundle (.app + .dmg)
+        env:
+          TARGET: ${{ matrix.target }}
+          ARCH_LABEL: ${{ matrix.arch }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY || '-' }}
+          NOTARIZE: ${{ secrets.APPLE_ID != '' && '1' || '0' }}
+        run: scripts/bundle-macos.sh
+
+      - name: Remove temporary keychain
+        if: always() && env.APPLE_CERTIFICATE != ''
+        run: scripts/ci/macos-keychain.sh cleanup
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: germal-macos-${{ matrix.arch }}
+          path: dist/Germal-macos-${{ matrix.arch }}.dmg
+          if-no-files-found: error
+
+  linux:
+    name: Linux ${{ matrix.arch }}
+    needs: [verify-version]
+    if: ${{ !cancelled() && (needs.verify-version.result == 'success' || needs.verify-version.result == 'skipped') }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x64, runner: ubuntu-22.04 }
+          - { arch: arm64, runner: ubuntu-22.04-arm }
+    steps:
+      - uses: actions/checkout@v4
+      - name: System libraries (GPUI)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang cmake pkg-config libasound2-dev libfontconfig-dev libwayland-dev \
+            libx11-xcb-dev libxkbcommon-x11-dev libxkbcommon-dev libssl-dev libzstd-dev \
+            libvulkan-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-${{ matrix.arch }}
+      - name: Package (.tar.gz)
+        env:
+          ARCH_LABEL: ${{ matrix.arch }}
+        run: scripts/package-linux.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: germal-linux-${{ matrix.arch }}
+          path: dist/Germal-linux-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+
+  windows:
+    name: Windows ${{ matrix.arch }}
+    needs: [verify-version]
+    if: ${{ !cancelled() && (needs.verify-version.result == 'success' || needs.verify-version.result == 'skipped') }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x64, runner: windows-latest }
+          - { arch: arm64, runner: windows-11-arm }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-${{ matrix.arch }}
+      - name: Install WiX
+        run: dotnet tool install --global wix --version 6.*
+      - name: Package (.exe + .msi)
+        shell: pwsh
+        env:
+          ARCH_LABEL: ${{ matrix.arch }}
+        run: ./scripts/package-windows.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: germal-windows-${{ matrix.arch }}
+          path: |
+            dist/Germal-windows-${{ matrix.arch }}.exe
+            dist/Germal-windows-${{ matrix.arch }}.msi
+          if-no-files-found: error
+
+  checksums:
+    name: checksums & signatures
+    needs: [macos, linux, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: SHA256SUMS
+        working-directory: dist
+        run: sha256sum Germal-* | tee SHA256SUMS
+      - name: Sign with minisign (when MINISIGN_SECRET_KEY is set)
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          [ -n "$MINISIGN_SECRET_KEY" ] || { echo "MINISIGN_SECRET_KEY not set; skipping signatures"; exit 0; }
+          sudo apt-get update && sudo apt-get install -y minisign
+          printf '%s' "$MINISIGN_SECRET_KEY" > "$RUNNER_TEMP/minisign.key"
+          cd dist
+          for f in Germal-* SHA256SUMS; do minisign -S -s "$RUNNER_TEMP/minisign.key" -m "$f" < /dev/null; done
+          rm -f "$RUNNER_TEMP/minisign.key"
+          python3 ../scripts/ci/gen-oss-manifest.py --tag "${GITHUB_REF_NAME:-manual}" --assets-dir . \
+            --base-url "https://github.com/${GITHUB_REPOSITORY}/releases/latest/download" --out latest.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: germal-release-files
+          path: dist/*
+          if-no-files-found: error
+
+  draft-release:
+    name: draft GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [checksums]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: germal-release-files
+          path: dist
+      # 草稿：不会公开，需要在 GitHub 页面上检查后手动 Publish
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          files: dist/*

@@ -1,0 +1,6273 @@
+//! gpui TestAppContext 测试：Tab 增删激活、发送状态流转、取消与 generation 丢弃、实时耗时。
+//!
+//! 约定：凡会触发真实 tokio 任务（发请求、写文件）的测试，开头必须 `cx.executor().allow_parking()`，
+//! 否则 gpui 测试调度器会因为 tokio 线程唤醒任务而判定"测试不确定"并 panic。
+//! gpui 测试时钟是虚拟的：只有 `advance_clock` 会推进，`wait_until` 每轮推进 10 ms 让计时器也能触发。
+
+use std::{
+    cell::{Cell, RefCell},
+    io::{Read, Write},
+    net::TcpListener,
+    path::PathBuf,
+    rc::Rc,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use germal_core::body::spill::SpillFile;
+use germal_core::body::tier::{EDITOR_MAX_LINES, ViewTier};
+use germal_core::codegen::{CodeTarget, PLACEHOLDER_URL};
+use germal_core::http::{BodyStore, RequestError};
+use germal_core::model::{
+    AppSettings, AssertOp, BodyKind, Environment, FormField, FormValue, HttpVersionPref, KeyValue,
+    Method, PostOp, PostOpKind, PreOp, PreOpKind, RawFormat, RequestDraft, ResponseMeta,
+    ResponseSource, SavedRequest, SplitDirection, TabDraft, TabId, ThemePref, Ulid, VarScope,
+    Variable, WorkspaceState,
+};
+use germal_core::ops::{OpFailure, OpOutcome, OpSkip};
+use germal_core::store::{Store, codec::decode};
+use germal_core::tls::{CertWarning, CertificateInfo};
+use gpui_kit::base::TextSelection;
+use gpui_kit::component::{
+    ActiveTheme, IndexPath, Root, WindowExt,
+    input::{InputEvent, InputState},
+    select::{SelectEvent, SelectState},
+};
+use gpui_kit::{
+    AppContext, Entity, Focusable, IntoElement, Modifiers, MouseButton, SharedString,
+    TestAppContext, VisualTestContext, point, px, size,
+};
+use tempfile::TempDir;
+
+use crate::i18n::Locale;
+use crate::state::request_tab::{
+    BODY_HINT_BYTES, BodyHint, BodyMode, DRAFT_DEBOUNCE, Notice, RequestSection, RequestTab,
+    ResponseSection, SseBodyMode,
+};
+use crate::state::response::{OpsReport, ResponseState, ResponseView};
+use crate::state::saved_filter::SavedFilter;
+use crate::state::settings;
+use crate::state::store;
+use crate::state::update::{self, InstallKind};
+use crate::state::variables;
+use crate::state::workspace::{
+    SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, SidebarSection, ToolSection,
+    Workspace,
+};
+use crate::ui::body_view::{LINE_HEIGHT_PX, gutter_px};
+use crate::ui::kv_table::{KvPlaceholder, KvTable, RowKind};
+use crate::ui::ops_table::{OpsMode, OpsTable, OpsTableEvent, PostRowKind};
+use crate::ui::sidebar::SAVED_ROW_HEIGHT;
+use crate::ui::tab_strip::{page_count, tabs_per_page};
+use crate::ui::variables_sheet::{SheetScope, VariablesSheet};
+use germal_core::model::{LanguagePref, MAX_TAB_ROWS};
+
+pub(crate) fn init(cx: &mut TestAppContext) -> &mut VisualTestContext {
+    init_globals(cx);
+    cx.add_empty_window()
+}
+
+/// 只装全局（组件库、主题、bridge），窗口由调用方决定怎么开。
+pub(crate) fn init_globals(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        crate::theme::install(cx);
+        crate::bridge::init(cx);
+    });
+}
+
+/// 把一个 Tab 装进带 `Root` 的窗口并画一帧：`Root` 挂着窗口级文本选择层，
+/// 鼠标拖选 / 复制这类 UI 集成测试要在这样的窗口里跑。返回 Tab 与它所在窗口的上下文。
+pub(crate) fn tab_in_root_window(
+    cx: &mut TestAppContext,
+) -> (Entity<RequestTab>, &mut VisualTestContext) {
+    init_globals(cx);
+    let slot: Rc<RefCell<Option<Entity<RequestTab>>>> = Rc::new(RefCell::new(None));
+    let slot_for_root = slot.clone();
+    let (_, cx) = cx.add_window_view(move |window, cx| {
+        let tab = cx.new(|cx| RequestTab::new(Ulid::generate(), window, cx));
+        *slot_for_root.borrow_mut() = Some(tab.clone());
+        Root::new(tab, window, cx)
+    });
+    let tab = slot
+        .borrow_mut()
+        .take()
+        .expect("tab created inside the root view");
+    (tab, cx)
+}
+
+/// B 档纯文本响应：20 万零 1 行 `line <i>`。
+fn virtual_tier_lines() -> String {
+    (0..EDITOR_MAX_LINES + 1)
+        .map(|i| format!("line {i}\n"))
+        .collect()
+}
+
+#[gpui_kit::test]
+fn dragging_across_virtual_rows_selects_their_text(cx: &mut TestAppContext) {
+    let (tab, cx) = tab_in_root_window(cx);
+    let text = virtual_tier_lines();
+    install_done_with(
+        &tab,
+        "text/plain",
+        BodyStore::in_memory(text.into_bytes()),
+        cx,
+    );
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    let bounds = tab
+        .read_with(cx, |t, _| t.lines_selection.bounds())
+        .expect("the lines region was painted");
+    // 行文本从行号栏之后开始；从第 0 行文字左侧一点按下，拖到第 1 行行尾之外抬起
+    let gutter = px(gutter_px(EDITOR_MAX_LINES + 1));
+    let start = point(
+        bounds.left() + gutter - px(2.),
+        bounds.top() + px(LINE_HEIGHT_PX / 2.),
+    );
+    let end = point(
+        bounds.left() + gutter + px(300.),
+        bounds.top() + px(LINE_HEIGHT_PX * 1.5),
+    );
+    cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_move(end, Some(MouseButton::Left), Modifiers::default());
+    cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+        assert_eq!(
+            TextSelection::selected_text(window, cx),
+            "line 0\nline 1",
+            "两行被整行选中，复制文本按原文行尾拼接"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn copy_target_follows_the_response_section(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let tab = new_tab(cx);
+    cx.read(|app| {
+        assert!(
+            tab.read(app).copy_target_text().is_none(),
+            "没有响应就没东西可复制"
+        )
+    });
+
+    let body = BodyStore::in_memory(br#"{"a":1}"#.to_vec());
+    let mut meta = meta("application/json", body.len());
+    meta.headers = vec![
+        ("content-type".into(), "application/json".into()),
+        ("x-trace".into(), "abc".into()),
+    ];
+    let view = ResponseView::prepare(meta, &body);
+    cx.update(|window, cx| {
+        tab.update(cx, |t, cx| {
+            let g = t.generation;
+            t.apply_outcome(g, Ok((body, view, None)), window, cx);
+            // Body：跟随 Pretty / Raw
+            assert_eq!(t.copy_target_text().as_deref(), Some("{\n  \"a\": 1\n}"));
+            t.set_pretty(false, window, cx);
+            assert_eq!(t.copy_target_text().as_deref(), Some(r#"{"a":1}"#));
+            // Headers：一行一个 `Name: value`
+            t.response_section = ResponseSection::Headers;
+            assert_eq!(
+                t.copy_target_text().as_deref(),
+                Some("content-type: application/json\nx-trace: abc")
+            );
+            // 证书页没有可复制的文本
+            t.response_section = ResponseSection::Certificate;
+            assert!(t.copy_target_text().is_none());
+        })
+    });
+}
+
+#[gpui_kit::test]
+fn select_all_on_the_lines_region_copies_the_whole_body(cx: &mut TestAppContext) {
+    let (tab, cx) = tab_in_root_window(cx);
+    let text = virtual_tier_lines();
+    install_done_with(
+        &tab,
+        "text/plain",
+        BodyStore::in_memory(text.clone().into_bytes()),
+        cx,
+    );
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+        tab.update(cx, |t, cx| t.select_all_response_lines(window, cx));
+        let selected = TextSelection::selected_text(window, cx);
+        // 20 万行的全文，断言失败时别把整篇打出来
+        assert_eq!(selected.len(), text.len());
+        assert!(selected == text, "全选后复制的必须是整份原文");
+    });
+}
+
+pub(crate) fn new_tab(cx: &mut VisualTestContext) -> Entity<RequestTab> {
+    cx.update(|window, cx| cx.new(|cx| RequestTab::new(Ulid::generate(), window, cx)))
+}
+
+/// 带独立临时数据目录的基座：写入线程是独立 std 线程、`flush` 会阻塞测试线程，
+/// 必须 `allow_parking`；合并窗口取 0，让 `flush` 后立刻能读到文件。
+pub(crate) fn init_with_store(cx: &mut TestAppContext) -> (&mut VisualTestContext, Store, TempDir) {
+    cx.executor().allow_parking();
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open_with_delay(dir.path().to_path_buf(), Duration::ZERO).unwrap();
+    cx.update(|cx| store::install(cx, Ok(store.clone())));
+    (init(cx), store, dir)
+}
+
+/// 模拟用户在 URL 栏键入：`set_value` 不发 Change 事件，所以再直接驱动一次事件处理器。
+pub(crate) fn change_url(tab: &Entity<RequestTab>, url: &str, cx: &mut VisualTestContext) {
+    let url = url.to_string();
+    cx.update(|window, cx| {
+        tab.update(cx, |t, cx| {
+            let input = t.url.clone();
+            input.update(cx, |u, cx| u.set_value(url, window, cx));
+            t.on_url_event(&input, &InputEvent::Change, window, cx);
+        })
+    });
+}
+
+pub(crate) fn read_draft(store: &Store, id: TabId) -> Option<TabDraft> {
+    let bytes = std::fs::read(store.layout().draft_path(id)).ok()?;
+    decode(&bytes).ok()
+}
+
+pub(crate) fn read_workspace(store: &Store) -> Option<WorkspaceState> {
+    let bytes = std::fs::read(store.layout().workspace_path()).ok()?;
+    decode(&bytes).ok()
+}
+
+pub(crate) fn read_settings(store: &Store) -> Option<AppSettings> {
+    let bytes = std::fs::read(store.layout().settings_path()).ok()?;
+    decode(&bytes).ok()
+}
+
+pub(crate) fn read_request(store: &Store, id: Ulid) -> Option<SavedRequest> {
+    let bytes = std::fs::read(store.layout().request_path(id)).ok()?;
+    decode(&bytes).ok()
+}
+
+/// requests/ 目录下 .json 文件数。
+pub(crate) fn request_files(store: &Store) -> usize {
+    std::fs::read_dir(store.layout().requests_dir())
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+pub(crate) fn set_url_and_send(tab: &Entity<RequestTab>, url: &str, cx: &mut VisualTestContext) {
+    let url = url.to_string();
+    cx.update(|window, cx| {
+        tab.update(cx, |t, cx| {
+            t.url.update(cx, |u, cx| u.set_value(url, window, cx));
+            t.send(window, cx);
+        })
+    });
+}
+
+/// 轮询直到条件成立（最多 5 s）：每轮先把 gpui 调度器跑到空闲，推进虚拟时钟 10 ms，再让出真实时间给 tokio 线程。
+pub(crate) fn wait_until(
+    cx: &mut VisualTestContext,
+    mut pred: impl FnMut(&mut VisualTestContext) -> bool,
+) {
+    for _ in 0..500 {
+        cx.run_until_parked();
+        if pred(cx) {
+            return;
+        }
+        cx.executor().advance_clock(Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("condition not met within 5 s");
+}
+
+/// 只回一次固定响应的本地 HTTP 服务（std 线程，不依赖 tokio）。
+pub(crate) fn fake_json_server(body: &'static str) -> String {
+    fake_json_server_n(body, 1)
+}
+
+/// 接受 `n` 个连接（每个连接一次响应后关闭）。
+pub(crate) fn fake_json_server_n(body: &'static str, n: usize) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for _ in 0..n {
+            let Ok((mut stream, _)) = listener.accept() else {
+                break;
+            };
+            let mut buf = [0u8; 4096];
+            let mut got = Vec::new();
+            while let Ok(n) = stream.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                got.extend_from_slice(&buf[..n]);
+                if got.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(body.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+    format!("http://{addr}/")
+}
+
+/// 接受连接但永不回应，直到客户端断开。
+pub(crate) fn hanging_server() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 1024];
+            while let Ok(n) = stream.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+            }
+        }
+    });
+    format!("http://{addr}/")
+}
+
+/// 分两段滴流的 SSE 服务：先发 `first`，收到信号后再发 `rest` 并结束。
+/// 两段之间连接保持打开，让测试能在"在途"状态下断言实时视图。
+pub(crate) fn sse_drip_server(
+    first: &'static str,
+    rest: &'static str,
+) -> (String, std::sync::mpsc::Sender<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (release, gate) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        let chunk = |s: &str| format!("{:x}\r\n{s}\r\n", s.len());
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 4096];
+            let mut got = Vec::new();
+            while let Ok(n) = stream.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                got.extend_from_slice(&buf[..n]);
+                if got.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(chunk(first).as_bytes());
+            let _ = stream.flush();
+            // 客户端断开（取消 / 测试失败）时 recv 出错，直接收尾
+            let _ = gate.recv();
+            let _ = stream.write_all(chunk(rest).as_bytes());
+            let _ = stream.write_all(b"0\r\n\r\n");
+            let _ = stream.flush();
+        }
+    });
+    (format!("http://{addr}/"), release)
+}
+
+pub(crate) fn refused_url() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    format!("http://127.0.0.1:{port}/")
+}
+
+#[gpui_kit::test]
+fn workspace_tabs_add_close_activate(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let ws = cx.update(|window, cx| cx.new(|cx| Workspace::new(window, cx)));
+    cx.update(|window, cx| {
+        ws.update(cx, |ws, cx| {
+            assert_eq!(ws.tab_count(), 1);
+            let first = ws.active_tab();
+            ws.new_tab(window, cx);
+            let second = ws.active_tab();
+            ws.new_tab(window, cx);
+            assert_eq!((ws.tab_count(), ws.active_index()), (3, 2));
+            ws.activate(0, cx);
+            assert_eq!(ws.active_index(), 0);
+            assert_eq!(ws.active_tab(), first);
+            ws.close_tab(0, window, cx);
+            assert_eq!((ws.tab_count(), ws.active_index()), (2, 0));
+            assert_eq!(ws.active_tab(), second);
+            ws.close_tab(1, window, cx);
+            ws.close_tab(0, window, cx);
+            // 关掉最后一个 Tab 会自动新建一个空 Tab
+            assert_eq!((ws.tab_count(), ws.active_index()), (1, 0));
+            assert_ne!(ws.active_tab(), second);
+        });
+    });
+}
+
+#[gpui_kit::test]
+fn send_to_refused_port_ends_in_failed(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let cx = init(cx);
+    let tab = new_tab(cx);
+    set_url_and_send(&tab, &refused_url(), cx);
+    cx.read(|app| assert!(tab.read(app).response.is_in_flight()));
+    wait_until(cx, |cx| {
+        cx.read(|app| !tab.read(app).response.is_in_flight())
+    });
+    cx.read(|app| {
+        assert!(
+            matches!(
+                tab.read(app).response.error(),
+                Some(RequestError::ConnectionRefused(_))
+            ),
+            "{:?}",
+            tab.read(app).response.error()
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn load_sheet_runs_the_requested_number_of_requests(cx: &mut TestAppContext) {
+    use crate::ui::load_sheet::{LoadSheet, Phase, Target};
+    cx.executor().allow_parking();
+    let cx = init(cx);
+    let sheet = cx.update(|window, cx| cx.new(|cx| LoadSheet::new(window, cx)));
+    let url = fake_json_server_n(r#"{"a":1}"#, 100);
+    let target = Target {
+        draft: germal_core::model::RequestDraft {
+            url: url.clone(),
+            ..Default::default()
+        },
+        group: None,
+        version: Default::default(),
+        url: url.clone(),
+        host: None,
+    };
+    let req = germal_core::http::HttpRequest {
+        method: germal_core::model::Method::Get,
+        url: url.parse().unwrap(),
+        headers: vec![],
+        body: germal_core::http::OutboundBody::Empty,
+    };
+    cx.update(|_, cx| {
+        sheet.update(cx, |s, cx| {
+            s.set_target(target, cx);
+            s.start(req, cx)
+        })
+    });
+    wait_until(cx, |cx| cx.read(|app| !sheet.read(app).is_running()));
+    cx.read(|app| {
+        let s = sheet.read(app);
+        assert!(matches!(s.phase(), Phase::Done));
+        let r = s.report().expect("finished with a report");
+        // 默认 100 次 / 10 并发
+        assert_eq!((r.total, r.errors, r.planned), (100, 0, 100));
+    });
+}
+
+#[gpui_kit::test]
+fn load_target_url_is_editable_and_only_overrides_when_changed(cx: &mut TestAppContext) {
+    use crate::ui::load_sheet::{LoadSheet, Target};
+    let cx = init(cx);
+    let sheet = cx.update(|window, cx| cx.new(|cx| LoadSheet::new(window, cx)));
+    let target = Target {
+        draft: germal_core::model::RequestDraft {
+            url: "https://a.test/x".into(),
+            ..Default::default()
+        },
+        group: None,
+        version: Default::default(),
+        url: "https://a.test/x?p=1".into(),
+        host: None,
+    };
+    cx.update(|_, cx| sheet.update(cx, |s, cx| s.set_target(target, cx)));
+    // 渲染时把初值写进输入框；没改就不覆盖草稿
+    let el = sheet.clone();
+    cx.draw(point(px(0.), px(0.)), size(px(400.), px(700.)), |_, _| {
+        el.into_any_element()
+    });
+    cx.read(|app| {
+        let s = sheet.read(app);
+        assert_eq!(s.current_url(app), "https://a.test/x?p=1");
+        assert!(s.overrides(app).is_none());
+    });
+    cx.update(|window, cx| {
+        sheet.update(cx, |s, cx| {
+            s.set_url_for_test("https://b.test/y", window, cx)
+        })
+    });
+    cx.read(|app| {
+        let (m, url) = sheet
+            .read(app)
+            .overrides(app)
+            .expect("edited url overrides");
+        assert_eq!(
+            (m, url.as_str()),
+            (germal_core::model::Method::Get, "https://b.test/y")
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn opening_the_load_page_targets_the_active_tab_and_draws(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let ws = cx.update(|window, cx| cx.new(|cx| Workspace::new(window, cx)));
+    let tab = cx.read(|app| ws.read(app).active_tab());
+    cx.update(|window, cx| {
+        tab.update(cx, |t, cx| {
+            t.url.update(cx, |u, cx| {
+                u.set_value("https://api.example.com/v1/items", window, cx)
+            })
+        })
+    });
+    cx.update(|_, cx| {
+        ws.update(cx, |ws, cx| {
+            ws.open_sidebar_section(SidebarSection::LoadTest, cx)
+        })
+    });
+    cx.read(|app| {
+        let sheet = ws.read(app).load_sheet.read(app);
+        let t = sheet.target().expect("target defaults to the active tab");
+        assert_eq!(t.url, "https://api.example.com/v1/items");
+        assert_eq!(t.host.as_deref(), Some("api.example.com"));
+    });
+    cx.update(|window, cx| window.blur(cx));
+    let element = ws.clone();
+    cx.draw(point(px(0.), px(0.)), size(px(1400.), px(900.)), |_, _| {
+        element.into_any_element()
+    });
+}
+
+fn recorded(id: i64, method: &str, status: Option<u16>) -> germal_recorder::db::Entry {
+    germal_recorder::db::Entry {
+        id,
+        category: germal_recorder::db::category(method).to_string(),
+        method: method.into(),
+        url: format!("https://api.example.com/v1/items/{id}?page=2"),
+        host: "api.example.com".into(),
+        path: format!("/v1/items/{id}"),
+        query: Some("page=2".into()),
+        resource_type: "Fetch".into(),
+        req_headers:
+            r#"{"Authorization":"Bearer abc.def.ghi","Cookie":"sid=1; theme=dark",":path":"/x"}"#
+                .into(),
+        post_data: Some(r#"{"name":"x"}"#.into()),
+        status,
+        res_headers: Some(
+            r#"{"content-type":"application/json","set-cookie":"a=1; HttpOnly\nb=2"}"#.into(),
+        ),
+        res_mime: Some("application/json".into()),
+        res_body: Some(r#"{"ok":true}"#.into()),
+        res_body_b64: false,
+        error: None,
+        started_ms: Some(1_782_452_730_123),
+        ttfb_ms: Some(42.0),
+        duration_ms: Some(1234.0),
+        res_size: Some(2048),
+        page_url: Some("https://app.example.com/dashboard?tab=1".into()),
+        meta: Some(
+            r#"{"response":{"protocol":"h2","remoteIPAddress":"1.2.3.4"},"timingMs":{"dns":1.5}}"#
+                .into(),
+        ),
+    }
+}
+
+#[gpui_kit::test]
+fn record_view_lists_filters_and_draws_details(cx: &mut TestAppContext) {
+    use crate::ui::record_sheet::RecordSheet;
+    use crate::ui::record_view::{RecordView, Scope};
+    let cx = init(cx);
+    let sheet = cx.update(|_, cx| cx.new(|_| RecordSheet::new()));
+    let view = cx.update(|_, cx| cx.new(|cx| RecordView::new(&sheet, cx)));
+    let rows = vec![
+        recorded(1, "GET", Some(200)),
+        recorded(2, "POST", Some(201)),
+        recorded(3, "DELETE", None),
+    ];
+    let mut rows = rows;
+    rows[2].host = "cdn.example.com".into();
+    let detail = recorded(2, "POST", Some(201));
+    cx.update(|_, cx| view.update(cx, |v, cx| v.load_for_test(rows, Some(detail), cx)));
+    cx.read(|app| assert_eq!(view.read(app).visible_len(), 3));
+    // 过滤器：POST 只剩一条；其他（DELETE）一条
+    cx.update(|_, cx| view.update(cx, |v, cx| v.filter_for_test(2, cx)));
+    cx.read(|app| assert_eq!(view.read(app).visible_len(), 1));
+    cx.update(|_, cx| view.update(cx, |v, cx| v.filter_for_test(3, cx)));
+    cx.read(|app| assert_eq!(view.read(app).visible_len(), 1));
+    cx.update(|_, cx| view.update(cx, |v, cx| v.filter_for_test(0, cx)));
+    // 域名树：api.example.com 两条（GET、POST）、cdn.example.com 一条 → 同属注册域 example.com
+    cx.read(|app| {
+        let tree = view.read(app).domain_tree();
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree[0].domain, "example.com");
+        assert_eq!(tree[0].total, 3);
+        assert_eq!(
+            tree[0].hosts,
+            vec![
+                ("api.example.com".to_string(), 2),
+                ("cdn.example.com".to_string(), 1)
+            ]
+        );
+    });
+    cx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.select_scope(Scope::Host("cdn.example.com".into()), cx)
+        })
+    });
+    cx.read(|app| assert_eq!(view.read(app).visible_len(), 1));
+    cx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.select_scope(Scope::Domain("example.com".into()), cx)
+        })
+    });
+    cx.read(|app| assert_eq!(view.read(app).visible_len(), 3));
+    cx.update(|_, cx| view.update(cx, |v, cx| v.select_scope(Scope::All, cx)));
+    cx.read(|app| assert_eq!(view.read(app).visible_len(), 3));
+
+    cx.update(|window, cx| window.blur(cx));
+    let element = view.clone();
+    cx.draw(point(px(0.), px(0.)), size(px(1200.), px(800.)), |_, _| {
+        element.into_any_element()
+    });
+}
+
+#[gpui_kit::test]
+fn send_to_json_server_ends_in_done(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let cx = init(cx);
+    let tab = new_tab(cx);
+    set_url_and_send(&tab, &fake_json_server(r#"{"a":1}"#), cx);
+    wait_until(cx, |cx| {
+        cx.read(|app| !tab.read(app).response.is_in_flight())
+    });
+    cx.read(|app| {
+        let tab = tab.read(app);
+        assert!(tab.response.is_done(), "{:?}", tab.response.error());
+        // 响应编辑器已被写入美化后的文本
+        assert_eq!(
+            tab.response_editor_for("json").read(app).value().as_ref(),
+            "{\n  \"a\": 1\n}"
+        );
+    });
+}
+
+/// SSE 端到端：请求在途时拼装文本就已可见（"收到就展示"），完成后
+/// Done 视图带事件列表、拼装文本、usage 与 TTFT，编辑器写入的是拼装文本。
+#[gpui_kit::test]
+fn sse_stream_displays_incrementally_and_builds_view(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let cx = init(cx);
+    let tab = new_tab(cx);
+    let first = "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n";
+    let rest = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n",
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2}}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let (url, release) = sse_drip_server(first, rest);
+    set_url_and_send(&tab, &url, cx);
+
+    // 第一段送达后：仍在途，但实时视图已经拼出文本
+    wait_until(cx, |cx| {
+        cx.read(|app| match &tab.read(app).response {
+            ResponseState::InFlight { live: Some(l), .. } => l.stream.has_text(),
+            _ => false,
+        })
+    });
+    cx.read(|app| {
+        let t = tab.read(app);
+        let ResponseState::InFlight { live: Some(l), .. } = &t.response else {
+            panic!("expected live SSE state");
+        };
+        assert_eq!(l.display_text().as_ref(), "Hel");
+        assert_eq!(l.event_count, 1);
+        assert!(l.first_delta.is_some(), "TTFT 在第一个 delta 时就该定格");
+    });
+    // 真实渲染一帧：实时视图（render_sse_live）panic / 布局错会当场暴露
+    draw_tab(&tab, cx);
+
+    // 放行剩余事件并等待完成
+    release.send(()).unwrap();
+    wait_until(cx, |cx| {
+        cx.read(|app| !tab.read(app).response.is_in_flight())
+    });
+    cx.read(|app| {
+        let t = tab.read(app);
+        let ResponseState::Done { view, .. } = &t.response else {
+            panic!("expected Done, got error {:?}", t.response.error());
+        };
+        let sse = view.sse.as_ref().expect("SSE 响应必须有事件视图");
+        assert_eq!(sse.events.len(), 4);
+        assert_eq!(sse.text.as_ref().unwrap().doc.text(), "Hello");
+        assert_eq!(sse.usage.input_tokens, Some(3));
+        assert_eq!(sse.usage.output_tokens, Some(2));
+        assert!(sse.first_delta.is_some(), "TTFT 必须从在途状态合并进来");
+        // 默认视图是拼装文本：编辑器里是 "Hello" 而不是原始事件流
+        assert_eq!(t.sse_mode, SseBodyMode::Text);
+        assert_eq!(
+            t.response_editor_for("text").read(app).value().as_ref(),
+            "Hello"
+        );
+    });
+
+    // 三种视图各真实渲染一帧：统计条 + 文本编辑器 / 事件列表 / 原始文本
+    draw_tab(&tab, cx);
+    cx.update(|window, cx| tab.update(cx, |t, cx| t.set_sse_mode(SseBodyMode::Events, window, cx)));
+    draw_tab(&tab, cx);
+
+    // 切到"原始"视图：编辑器换成完整事件流原文
+    cx.update(|window, cx| tab.update(cx, |t, cx| t.set_sse_mode(SseBodyMode::Raw, window, cx)));
+    draw_tab(&tab, cx);
+    cx.read(|app| {
+        let t = tab.read(app);
+        assert!(
+            t.response_editor_for("text")
+                .read(app)
+                .value()
+                .starts_with("data: {\"choices\""),
+            "原始视图应显示 SSE 原文"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn cancel_marks_cancelled_and_bumps_generation(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let cx = init(cx);
+    let tab = new_tab(cx);
+    set_url_and_send(&tab, &hanging_server(), cx);
+    cx.update(|window, cx| {
+        tab.update(cx, |t, cx| {
+            assert!(t.response.is_in_flight());
+            let g = t.generation;
+            // 在途时再次 send 不重发（Plan 1 Ruling 15）
+            t.send(window, cx);
+            assert_eq!(t.generation, g);
+            t.cancel(cx);
+            assert_eq!(t.generation, g + 1);
+            assert!(matches!(t.response.error(), Some(RequestError::Cancelled)));
+            // 未在途时再次取消不改变任何状态
+            t.cancel(cx);
+            assert_eq!(t.generation, g + 1);
+        })
+    });
+    // 被 drop 的任务完成清理后，状态不得被旧任务改写
+    std::thread::sleep(Duration::from_millis(50));
+    cx.run_until_parked();
+    cx.read(|app| {
+        assert!(matches!(
+            tab.read(app).response.error(),
+            Some(RequestError::Cancelled)
+        ))
+    });
+}
+
+#[gpui_kit::test]
+fn stale_generation_outcome_is_discarded(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let tab = new_tab(cx);
+    cx.update(|window, cx| {
+        tab.update(cx, |t, cx| {
+            t.generation = 5;
+            t.apply_outcome(4, Err(RequestError::Other("stale".into())), window, cx);
+            assert!(matches!(t.response, ResponseState::Idle));
+            t.apply_outcome(5, Err(RequestError::Timeout), window, cx);
+            assert!(matches!(t.response.error(), Some(RequestError::Timeout)));
+        })
+    });
+}
+
+#[gpui_kit::test]
+fn elapsed_ticker_notifies_while_in_flight_and_stops_after_cancel(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let cx = init(cx);
+    let tab = new_tab(cx);
+    let ticks = Rc::new(Cell::new(0usize));
+    let counter = ticks.clone();
+    let _sub = cx.update(|_, cx| cx.observe(&tab, move |_, _| counter.set(counter.get() + 1)));
+    set_url_and_send(&tab, &hanging_server(), cx);
+    cx.run_until_parked();
+    let baseline = ticks.get();
+    // wait_until 每轮推进虚拟时钟 10 ms；100 ms 的计时器应在 ≤ 1 s 虚拟时间内至少触发 3 次
+    wait_until(cx, |_| ticks.get() >= baseline + 3);
+    cx.update(|_, cx| tab.update(cx, |t, cx| t.cancel(cx)));
+    cx.run_until_parked();
+    let after_cancel = ticks.get();
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.run_until_parked();
+    assert_eq!(
+        ticks.get(),
+        after_cancel,
+        "ticker must stop once the request is cancelled"
+    );
+}
+
+/// B 档端到端（无 GUI）：超过 EDITOR_MAX_LINES 的 text/plain 响应不写编辑器、没有 Pretty 切换，
+/// 并且行视图与 Headers 列表都能真正绘制一帧（uniform_list + Scrollbar 的运行时路径）。
+#[gpui_kit::test]
+fn large_text_body_renders_as_virtual_rows(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let tab = new_tab(cx);
+
+    let text: String = (0..EDITOR_MAX_LINES + 1)
+        .map(|i| format!("line {i}\n"))
+        .collect();
+    let body = BodyStore::in_memory(text.as_bytes().to_vec());
+    let meta = ResponseMeta {
+        status: 200,
+        status_text: "OK".into(),
+        headers: vec![("content-type".into(), "text/plain".into())],
+        duration: Duration::from_millis(1),
+        ttfb: None,
+        body_len: text.len() as u64,
+        content_type: Some("text/plain".into()),
+        http_version: None,
+        certificate: None,
+    };
+    let view = ResponseView::prepare(meta, &body);
+    cx.update(|window, cx| {
+        tab.update(cx, |t, cx| {
+            let g = t.generation;
+            t.apply_outcome(g, Ok((body.clone(), view, None)), window, cx);
+        })
+    });
+
+    cx.read(|app| {
+        let t = tab.read(app);
+        let ResponseState::Done { view, .. } = &t.response else {
+            panic!("expected Done");
+        };
+        // text/plain 没有美化文本 → 面板隐藏 Pretty/Raw 切换
+        assert!(!view.has_pretty());
+        assert!(!view.is_preview());
+        let doc = view.doc(true).expect("text body has a doc");
+        assert_eq!(doc.tier, ViewTier::Virtual);
+        assert_eq!(doc.doc.line_count(), EDITOR_MAX_LINES + 1);
+        // B 档不经过只读编辑器：编辑器仍为空，主线程没有搬运过 2 MB 文本
+        assert!(
+            t.response_editor_for("text")
+                .read(app)
+                .value()
+                .as_ref()
+                .is_empty()
+        );
+    });
+
+    // 真正绘制整个 Tab（Body 页签 → B 档行视图，再切到 Headers 页签 → Headers 列表）。
+    // 渲染闭包只对可见区间切片，20 万行必须在瞬间完成（每帧 O(n) 的实现会慢上几个数量级）。
+    let started = Instant::now();
+    draw_tab(&tab, cx);
+    cx.update(|_, cx| {
+        tab.update(cx, |t, cx| {
+            t.response_section = ResponseSection::Headers;
+            cx.notify();
+        })
+    });
+    draw_tab(&tab, cx);
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "rendering must be O(visible lines), took {elapsed:?}"
+    );
+
+    // uniform_list 真的完成了布局：`contents` 是「行高 × 总行数」，`item` 是视口。
+    // 视口远小于内容 → 这一帧只渲染了可见的那几十行。
+    cx.read(|app| {
+        let t = tab.read(app);
+        let body = t
+            .body_scroll
+            .0
+            .borrow()
+            .last_item_size
+            .expect("body list was laid out");
+        assert_eq!(
+            body.contents.height,
+            px(LINE_HEIGHT_PX * (EDITOR_MAX_LINES + 1) as f32)
+        );
+        assert!(body.item.height < body.contents.height / 100.);
+        // Headers 列表（gpui `list`，变高虚拟化）按响应行数 reset 过：
+        // 该响应只有一个 content-type 头
+        assert_eq!(t.headers_list.item_count(), 1);
+    });
+}
+
+/// SSE 事件列表的长 data 不截断在视口内：内容宽度按最长事件测量，
+/// 超出视口时可横向滚动（与 B/C 档行视图同一套机制）。
+#[gpui_kit::test]
+fn sse_events_view_scrolls_horizontally(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let tab = new_tab(cx);
+    let body = format!(
+        "data: {{\"note\":\"{}\"}}\n\ndata: short\n\n",
+        "x".repeat(500)
+    )
+    .into_bytes();
+    let view = ResponseView::prepare(
+        meta("text/event-stream", body.len() as u64),
+        &BodyStore::in_memory(body.clone()),
+    );
+    cx.update(|window, cx| {
+        tab.update(cx, |t, cx| {
+            let g = t.generation;
+            t.apply_outcome(g, Ok((BodyStore::in_memory(body), view, None)), window, cx);
+            // 该流拼不出 delta：Text 模式自动回落到事件列表
+            assert_eq!(t.sse_mode, SseBodyMode::Text);
+        })
+    });
+    draw_tab(&tab, cx);
+    cx.read(|app| {
+        let t = tab.read(app);
+        let laid_out = t
+            .body_scroll
+            .0
+            .borrow()
+            .last_item_size
+            .expect("events list was laid out");
+        assert!(
+            laid_out.contents.width > laid_out.item.width,
+            "长事件应超出视口宽度、可横向滚动：contents={:?} viewport={:?}",
+            laid_out.contents.width,
+            laid_out.item.width
+        );
+    });
+}
+
+/// Headers 的长值折行展示（不截断、不横滚）：变高列表布局后，
+/// 长值行的实际高度必须远高于短值行。
+#[gpui_kit::test]
+fn long_header_values_wrap_instead_of_truncating(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let tab = new_tab(cx);
+    let mut m = meta("text/plain", 2);
+    m.headers = vec![
+        ("x-short".into(), "1".into()),
+        // 带空格的长值：按词折行
+        ("x-words".into(), "word ".repeat(400)),
+        // 2000 个无空格字符（base64 场景）：只有字符级硬断才装得下
+        ("x-solid".into(), "x".repeat(2000)),
+    ];
+    let view = ResponseView::prepare(m, &BodyStore::in_memory(b"ok".to_vec()));
+    cx.update(|window, cx| {
+        tab.update(cx, |t, cx| {
+            let g = t.generation;
+            t.apply_outcome(
+                g,
+                Ok((BodyStore::in_memory(b"ok".to_vec()), view, None)),
+                window,
+                cx,
+            );
+            t.response_section = ResponseSection::Headers;
+            cx.notify();
+        })
+    });
+    draw_tab(&tab, cx);
+    let short = cx.read(|app| {
+        let t = tab.read(app);
+        assert_eq!(t.headers_list.item_count(), 3);
+        let short = t
+            .headers_list
+            .bounds_for_item(0)
+            .expect("short row laid out")
+            .size
+            .height;
+        let words = t
+            .headers_list
+            .bounds_for_item(1)
+            .expect("words row laid out")
+            .size
+            .height;
+        assert!(
+            words > short * 3.,
+            "带空格长值应折成多行：short={short:?} words={words:?}"
+        );
+        short
+    });
+    // 行 1 折行后很高，行 2 在首帧视口 + overdraw 之外没被测量：滚过去再绘一帧
+    cx.update(|_, cx| {
+        tab.update(cx, |t, cx| {
+            t.headers_list.scroll_to_reveal_item(2);
+            cx.notify();
+        })
+    });
+    draw_tab(&tab, cx);
+    cx.read(|app| {
+        let t = tab.read(app);
+        let solid = t
+            .headers_list
+            .bounds_for_item(2)
+            .expect("solid row laid out")
+            .size
+            .height;
+        assert!(
+            solid > short * 3.,
+            "无空格长值应按字符硬断折行：short={short:?} solid={solid:?}"
+        );
+    });
+}
+
+fn draw_tab(tab: &Entity<RequestTab>, cx: &mut VisualTestContext) {
+    let tab = tab.clone();
+    cx.draw(point(px(0.), px(0.)), size(px(1000.), px(800.)), |_, _| {
+        tab.into_any_element()
+    });
+}
+
+pub(crate) fn meta(content_type: &str, body_len: u64) -> ResponseMeta {
+    ResponseMeta {
+        status: 200,
+        status_text: "OK".into(),
+        headers: vec![],
+        duration: Duration::from_millis(3),
+        ttfb: None,
+        body_len,
+        content_type: Some(content_type.into()),
+        http_version: None,
+        certificate: None,
+    }
+}
+
+/// 一张自签名测试证书的解析结果；`warnings` 由调用方决定要试哪条分支。
+pub(crate) fn cert_info(warnings: Vec<CertWarning>) -> CertificateInfo {
+    CertificateInfo {
+        subject: "CN=localhost, O=Germal Local Debug".into(),
+        issuer: "CN=localhost, O=Germal Local Debug".into(),
+        not_before: "Jan  1 00:00:00 2020 +00:00".into(),
+        not_after: "Jan  1 00:00:00 2100 +00:00".into(),
+        san: vec!["localhost".into(), "*.example.com".into()],
+        serial: "4A:2B:1C".into(),
+        signature_algorithm: "ecdsa-with-SHA256".into(),
+        sha256_fingerprint: "69:0A:78:ED".into(),
+        warnings,
+    }
+}
+
+/// 直接把一份准备好的响应灌进 Tab（绕过网络），generation 对齐。
+pub(crate) fn install_done(tab: &Entity<RequestTab>, body: BodyStore, cx: &mut VisualTestContext) {
+    install_done_with(tab, "application/json", body, cx);
+}
+
+/// `install_done` 的带 content-type 版本（二进制 / 纯文本响应的分档由它决定）。
+pub(crate) fn install_done_with(
+    tab: &Entity<RequestTab>,
+    content_type: &str,
+    body: BodyStore,
+    cx: &mut VisualTestContext,
+) {
+    let view = ResponseView::prepare(meta(content_type, body.len()), &body);
+    cx.update(|window, cx| {
+        tab.update(cx, |t, cx| {
+            t.generation += 1;
+            let g = t.generation;
+            t.apply_outcome(g, Ok((body, view, None)), window, cx);
+        })
+    });
+}
+
+#[gpui_kit::test]
+fn save_body_writes_memory_body_to_chosen_path(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let cx = init(cx);
+    let tab = new_tab(cx);
+    set_url_and_send(&tab, &fake_json_server(r#"{"a":1}"#), cx);
+    wait_until(cx, |cx| cx.read(|app| tab.read(app).response.is_done()));
+    let dest = std::env::temp_dir().join(format!("germal-save-mem-{}.json", std::process::id()));
+    let _ = std::fs::remove_file(&dest);
+
+    cx.update(|window, cx| tab.update(cx, |t, cx| t.save_body(window, cx)));
+    assert!(cx.did_prompt_for_new_path());
+    let chosen = dest.clone();
+    cx.simulate_new_path_selection(move |_| Some(chosen));
+    wait_until(cx, |cx| cx.read(|app| tab.read(app).notice.is_some()));
+    cx.read(|app| {
+        let notice = tab.read(app).notice.clone().unwrap();
+        assert!(matches!(notice, Notice::SavedTo(_)), "{notice:?}");
+    });
+    assert_eq!(std::fs::read(&dest).unwrap(), br#"{"a":1}"#);
+    let _ = std::fs::remove_file(&dest);
+}
+
+#[gpui_kit::test]
+fn save_body_copies_spilled_file(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let cx = init(cx);
+    let tab = new_tab(cx);
+    let (guard, mut file) = SpillFile::create().unwrap();
+    std::io::Write::write_all(&mut file, b"0123456789").unwrap();
+    drop(file);
+    let body = BodyStore::Spilled {
+        file: Arc::new(guard),
+        len: 10,
+        head: Arc::from(&b"0123456789"[..]),
+    };
+    install_done(&tab, body, cx);
+    cx.read(|app| {
+        let t = tab.read(app);
+        assert!(t.response.is_done());
+        let ResponseState::Done { view, .. } = &t.response else {
+            unreachable!()
+        };
+        assert!(view.is_preview());
+    });
+    let dest = std::env::temp_dir().join(format!("germal-save-spill-{}.bin", std::process::id()));
+    let _ = std::fs::remove_file(&dest);
+
+    cx.update(|window, cx| tab.update(cx, |t, cx| t.save_body(window, cx)));
+    let chosen = dest.clone();
+    cx.simulate_new_path_selection(move |_| Some(chosen));
+    wait_until(cx, |cx| cx.read(|app| tab.read(app).notice.is_some()));
+    assert_eq!(std::fs::read(&dest).unwrap(), b"0123456789");
+    let _ = std::fs::remove_file(&dest);
+}
+
+#[gpui_kit::test]
+fn cancelled_save_dialog_leaves_no_notice(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let tab = new_tab(cx);
+    install_done(&tab, BodyStore::in_memory(&b"{}"[..]), cx);
+    cx.update(|window, cx| tab.update(cx, |t, cx| t.save_body(window, cx)));
+    cx.simulate_new_path_selection(|_| None);
+    cx.run_until_parked();
+    cx.read(|app| assert!(tab.read(app).notice.is_none()));
+}
+
+#[gpui_kit::test]
+fn save_body_does_nothing_when_not_done(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let tab = new_tab(cx);
+    cx.update(|window, cx| tab.update(cx, |t, cx| t.save_body(window, cx)));
+    assert!(!cx.did_prompt_for_new_path());
+}
+
+#[gpui_kit::test]
+fn save_body_is_atomic_and_remembers_the_directory(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let cx = init(cx);
+    let tab = new_tab(cx);
+    install_done(&tab, BodyStore::in_memory(&br#"{"v":2}"#[..]), cx);
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("response.json");
+    std::fs::write(&dest, b"old content").unwrap();
+
+    // 第一次：对话框从默认目录打开（不是我们的临时目录）
+    cx.update(|window, cx| tab.update(cx, |t, cx| t.save_body(window, cx)));
+    let chosen = dest.clone();
+    let expected_dir = dir.path().to_path_buf();
+    cx.simulate_new_path_selection(move |opened_in| {
+        assert_ne!(opened_in, expected_dir.as_path());
+        Some(chosen)
+    });
+    wait_until(cx, |cx| cx.read(|app| tab.read(app).notice.is_some()));
+    assert_eq!(std::fs::read(&dest).unwrap(), br#"{"v":2}"#);
+    // 原子写：目录里只有目标文件，没有 .tmp* 残留
+    let names: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, vec!["response.json"]);
+
+    // 第二次：对话框从上次保存的目录打开
+    cx.update(|_, cx| {
+        tab.update(cx, |t, cx| {
+            t.notice = None;
+            cx.notify();
+        })
+    });
+    cx.update(|window, cx| tab.update(cx, |t, cx| t.save_body(window, cx)));
+    let second = dir.path().join("again.json");
+    let chosen = second.clone();
+    let expected_dir = dir.path().to_path_buf();
+    cx.simulate_new_path_selection(move |opened_in| {
+        assert_eq!(opened_in, expected_dir.as_path());
+        Some(chosen)
+    });
+    wait_until(cx, |cx| cx.read(|app| tab.read(app).notice.is_some()));
+    assert_eq!(std::fs::read(&second).unwrap(), br#"{"v":2}"#);
+    // 用户"另存为"目标按系统 umask 创建，不继承数据目录内部文件的 0600（Ruling P4-3）。
+    // 与同目录里 File::create 出来的探针文件比较，断言就与当前 umask 无关。
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let probe = dir.path().join("umask-probe");
+        std::fs::File::create(&probe).unwrap();
+        let expected = std::fs::metadata(&probe).unwrap().permissions().mode() & 0o777;
+        std::fs::remove_file(&probe).unwrap();
+        let mode = std::fs::metadata(&second).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, expected, "{mode:o} != {expected:o}");
+    }
+}
+
+#[gpui_kit::test]
+fn choose_file_sets_file_body_and_clear_resets_it(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let tab = new_tab(cx);
+    let path = std::env::temp_dir().join(format!("germal-choose-{}.json", std::process::id()));
+    std::fs::write(&path, b"{}").unwrap();
+
+    cx.update(|window, cx| tab.update(cx, |t, cx| t.choose_file(window, cx)));
+    assert!(cx.did_prompt_for_paths());
+    let chosen = path.clone();
+    cx.simulate_path_prompt_response(move |opts| {
+        assert!(opts.files && !opts.directories && !opts.multiple);
+        Some(vec![chosen])
+    });
+    // metadata 在 gpui 后台执行器上读取，跑到空闲即可
+    cx.run_until_parked();
+    cx.read(|app| {
+        let t = tab.read(app);
+        assert_eq!(t.body_mode, BodyMode::Binary);
+        assert_eq!(t.file_size, Some(2));
+        assert_eq!(
+            t.draft(app).body,
+            BodyKind::Binary {
+                path: path.clone(),
+                content_type: Some("application/json".into()),
+            }
+        );
+    });
+
+    cx.update(|_, cx| tab.update(cx, |t, cx| t.clear_file(cx)));
+    cx.read(|app| {
+        let t = tab.read(app);
+        assert_eq!(t.file_size, None);
+        assert_eq!(
+            t.draft(app).body,
+            BodyKind::Binary {
+                path: PathBuf::new(),
+                content_type: None,
+            }
+        );
+    });
+    let _ = std::fs::remove_file(&path);
+}
+
+#[gpui_kit::test]
+fn cancelled_file_dialog_keeps_previous_state(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let tab = new_tab(cx);
+    cx.update(|window, cx| tab.update(cx, |t, cx| t.choose_file(window, cx)));
+    cx.simulate_path_prompt_response(|_| None);
+    cx.run_until_parked();
+    cx.read(|app| {
+        let t = tab.read(app);
+        assert_eq!(t.body_mode, BodyMode::None);
+        assert!(t.file_path.is_none());
+    });
+}
+
+#[gpui_kit::test]
+fn oversized_raw_body_shows_file_hint(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let tab = new_tab(cx);
+    let big = "a".repeat(BODY_HINT_BYTES + 1);
+    cx.update(|window, cx| {
+        tab.update(cx, |t, cx| {
+            t.body_mode = BodyMode::Raw;
+            let editor = t.editor_for(RawFormat::Json).clone();
+            // set_value 不发 Change 事件（gpui-component 如此设计），这里直接驱动事件处理器模拟一次粘贴
+            editor.update(cx, |e, cx| e.set_value(big, window, cx));
+            t.on_body_editor_event(&editor, &InputEvent::Change, window, cx);
+            assert!(t.body_hint.unwrap().text().contains("10 MB"));
+            editor.update(cx, |e, cx| e.set_value("{}", window, cx));
+            t.on_body_editor_event(&editor, &InputEvent::Change, window, cx);
+            assert!(t.body_hint.is_none());
+        })
+    });
+}
+
+/// P2-3：切换 raw_format / body_mode 必须重新计算提示，否则会残留上一个编辑器的提示，
+/// 或者漏掉一个只通过 `set_value`（不发 Change 事件）灌入内容的编辑器。
+#[gpui_kit::test]
+fn switching_raw_format_or_body_mode_recomputes_hint(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let tab = new_tab(cx);
+    let big = "a".repeat(BODY_HINT_BYTES + 1);
+    cx.update(|window, cx| {
+        tab.update(cx, |t, cx| {
+            t.body_mode = BodyMode::Raw;
+            // JSON 编辑器灌入超大内容，但不经过事件处理器（模拟程序化写入 / 未触发 Change）
+            let json_editor = t.editor_for(RawFormat::Json).clone();
+            json_editor.update(cx, |e, cx| e.set_value(big, window, cx));
+            t.refresh_body_hint(cx);
+            assert!(t.body_hint.unwrap().text().contains("10 MB"));
+
+            // 切到 Text 格式：该编辑器是空的，提示应清空
+            t.raw_format = RawFormat::Text;
+            t.refresh_body_hint(cx);
+            assert!(t.body_hint.is_none());
+
+            // 切回 JSON：重新看到超大内容的提示
+            t.raw_format = RawFormat::Json;
+            t.refresh_body_hint(cx);
+            assert!(t.body_hint.unwrap().text().contains("10 MB"));
+
+            // 离开 raw 模式：提示必须清空
+            t.body_mode = BodyMode::None;
+            t.refresh_body_hint(cx);
+            assert!(t.body_hint.is_none());
+        })
+    });
+}
+
+/// 格式化必须保住字段顺序：这正是用 core 的单遍美化器、而不是 serde 的
+/// `to_string_pretty`（默认 BTreeMap，会按字母序重排 key）的理由，值得钉死。
+#[gpui_kit::test]
+fn format_body_reindents_without_reordering_keys(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let tab = new_tab(cx);
+    cx.update(|window, cx| {
+        tab.update(cx, |t, cx| {
+            t.body_mode = BodyMode::Raw;
+            t.raw_format = RawFormat::Json;
+            let editor = t.editor_for(RawFormat::Json).clone();
+            // 字母序会把 model 排到 messages 后面；这里刻意反着写
+            editor.update(cx, |e, cx| {
+                e.set_value(
+                    r#"{"model":"gpt-5.6","messages":[{"role":"user"}],"a":1}"#,
+                    window,
+                    cx,
+                )
+            });
+            t.dirty = false;
+
+            t.format_body(window, cx);
+
+            let out = editor.read(cx).text().to_string();
+            assert!(out.contains('\n'), "格式化后应该有换行：{out}");
+            assert!(out.contains("  \"model\""), "应该是 2 空格缩进：{out}");
+            let model_at = out.find("\"model\"").expect("model 还在");
+            let messages_at = out.find("\"messages\"").expect("messages 还在");
+            let a_at = out.find("\"a\"").expect("a 还在");
+            assert!(
+                model_at < messages_at && messages_at < a_at,
+                "字段顺序被重排了：{out}"
+            );
+        })
+    });
+    // 置脏走的是 replace_all 发出的 Change 事件 → on_body_editor_event 订阅，
+    // 而 gpui 的事件要等 effect 派发，所以断言必须在 update 闭包之外
+    cx.read(|app| {
+        let t = tab.read(app);
+        assert!(t.dirty, "格式化算一次用户改动");
+        assert!(t.body_hint.is_none());
+    });
+}
+
+#[gpui_kit::test]
+fn format_body_rejects_invalid_json(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let tab = new_tab(cx);
+    cx.update(|window, cx| {
+        tab.update(cx, |t, cx| {
+            t.body_mode = BodyMode::Raw;
+            t.raw_format = RawFormat::Json;
+            let editor = t.editor_for(RawFormat::Json).clone();
+            let broken = r#"{"a": 1,}"#;
+            editor.update(cx, |e, cx| e.set_value(broken, window, cx));
+            t.dirty = false;
+
+            t.format_body(window, cx);
+
+            assert_eq!(editor.read(cx).text().to_string(), broken, "内容一字未改");
+            assert_eq!(t.body_hint, Some(BodyHint::InvalidJson));
+            assert!(!t.dirty, "失败不该置脏");
+
+            // 用户一动手改，提示就该消失
+            editor.update(cx, |e, cx| e.set_value(r#"{"a": 1}"#, window, cx));
+            t.on_body_editor_event(&editor, &InputEvent::Change, window, cx);
+            assert!(t.body_hint.is_none());
+        })
+    });
+}
+
+#[gpui_kit::test]
+fn format_body_is_idempotent_and_scoped_to_json(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let tab = new_tab(cx);
+    cx.update(|window, cx| {
+        tab.update(cx, |t, cx| {
+            t.body_mode = BodyMode::Raw;
+            t.raw_format = RawFormat::Json;
+            let editor = t.editor_for(RawFormat::Json).clone();
+            editor.update(cx, |e, cx| e.set_value(r#"{"a":1}"#, window, cx));
+            t.format_body(window, cx);
+            let once = editor.read(cx).text().to_string();
+
+            // 再格式化一次：内容不变，也不再置脏
+            t.dirty = false;
+            t.format_body(window, cx);
+            assert_eq!(editor.read(cx).text().to_string(), once);
+            assert!(!t.dirty, "已经格式化好的不该再产生一次改动");
+
+            // 空请求体：no-op，也不报「非法 JSON」
+            editor.update(cx, |e, cx| e.set_value("   ", window, cx));
+            t.body_hint = None;
+            t.format_body(window, cx);
+            assert!(t.body_hint.is_none(), "空请求体不该报错");
+
+            // 非 JSON 格式 / 非 raw 模式：no-op
+            let text_editor = t.editor_for(RawFormat::Text).clone();
+            text_editor.update(cx, |e, cx| e.set_value(r#"{"a":1}"#, window, cx));
+            t.raw_format = RawFormat::Text;
+            t.format_body(window, cx);
+            assert_eq!(text_editor.read(cx).text().to_string(), r#"{"a":1}"#);
+
+            t.raw_format = RawFormat::Json;
+            t.body_mode = BodyMode::None;
+            editor.update(cx, |e, cx| e.set_value(r#"{"a":1}"#, window, cx));
+            t.format_body(window, cx);
+            assert_eq!(editor.read(cx).text().to_string(), r#"{"a":1}"#);
+        })
+    });
+}
+
+/// F1：draft() 的 Raw 分支直接从编辑器的 Rope 拷贝一次文本，不经过 `value()`（SharedString）
+/// 这道额外的中间拷贝；这里只断言最终结果，实现细节由 request_tab.rs 里的调用决定。
+#[gpui_kit::test]
+fn raw_body_draft_reads_editor_text_directly(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let tab = new_tab(cx);
+    cx.update(|window, cx| {
+        tab.update(cx, |t, cx| {
+            t.body_mode = BodyMode::Raw;
+            t.raw_format = RawFormat::Json;
+            let editor = t.editor_for(RawFormat::Json).clone();
+            editor.update(cx, |e, cx| e.set_value(r#"{"a":1}"#, window, cx));
+            assert_eq!(
+                t.draft(cx).body,
+                BodyKind::Raw {
+                    format: RawFormat::Json,
+                    text: r#"{"a":1}"#.into(),
+                }
+            );
+        })
+    });
+}
+
+#[gpui_kit::test]
+fn kv_table_set_values_roundtrip(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let table = cx.update(|window, cx| cx.new(|cx| KvTable::new(KvPlaceholder::Param, window, cx)));
+    let values = vec![
+        KeyValue {
+            description: "查询词".into(),
+            ..KeyValue::new("a", "1")
+        },
+        KeyValue {
+            enabled: false,
+            ..KeyValue::new("b", "")
+        },
+        // 只有描述也是一行有效数据，不能被当成空行丢掉
+        KeyValue {
+            description: "占位".into(),
+            ..KeyValue::new("", "")
+        },
+    ];
+    cx.update(|window, cx| {
+        table.update(cx, |t, cx| {
+            t.set_values(&values, window, cx);
+            assert_eq!(t.values(cx), values);
+            // 末尾保留一个空行用于新增
+            assert_eq!(t.row_count(), 4);
+            t.set_values(&[], window, cx);
+            assert!(t.values(cx).is_empty());
+            assert_eq!(t.row_count(), 1);
+        })
+    });
+    // Path 参数表（锁定 key）：不补空行
+    let locked = cx.update(|window, cx| {
+        cx.new(|cx| KvTable::new(KvPlaceholder::Param, window, cx).locked_keys(true))
+    });
+    cx.update(|window, cx| {
+        locked.update(cx, |t, cx| {
+            t.set_values(&values, window, cx);
+            assert_eq!(t.row_count(), 3);
+            assert_eq!(t.values(cx), values);
+        })
+    });
+}
+
+#[gpui_kit::test]
+fn kv_table_sync_keys_keeps_description(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let table = cx.update(|window, cx| {
+        cx.new(|cx| KvTable::new(KvPlaceholder::Param, window, cx).locked_keys(true))
+    });
+    cx.update(|window, cx| {
+        table.update(cx, |t, cx| {
+            t.set_values(
+                &[KeyValue {
+                    description: "用户 ID".into(),
+                    ..KeyValue::new("id", "7")
+                }],
+                window,
+                cx,
+            );
+            t.sync_keys(&["tenant".into(), "id".into()], window, cx);
+            let v = t.values(cx);
+            assert_eq!(v.len(), 2);
+            assert_eq!(v[0].key, "tenant");
+            assert_eq!(
+                v[1],
+                KeyValue {
+                    description: "用户 ID".into(),
+                    ..KeyValue::new("id", "7")
+                }
+            );
+        })
+    });
+}
+
+#[gpui_kit::test]
+fn load_draft_restores_every_body_kind_without_dirtying(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let tab = new_tab(cx);
+    let file = std::env::temp_dir().join(format!("germal-load-{}.json", std::process::id()));
+    let drafts = vec![
+        RequestDraft {
+            method: Method::Post,
+            url: "https://x.test/{id}?a=1".into(),
+            path_params: vec![KeyValue::new("id", "7")],
+            params: vec![KeyValue {
+                enabled: false,
+                ..KeyValue::new("q", "v")
+            }],
+            headers: vec![KeyValue::new("X-Token", "t")],
+            body: BodyKind::Raw {
+                format: RawFormat::Xml,
+                text: "<a/>".into(),
+            },
+            pre_ops: Vec::new(),
+            post_ops: Vec::new(),
+        },
+        RequestDraft {
+            method: Method::Put,
+            url: "https://x.test/form".into(),
+            body: BodyKind::FormUrlEncoded {
+                fields: vec![KeyValue::new("a", "1")],
+            },
+            ..Default::default()
+        },
+        RequestDraft {
+            method: Method::Delete,
+            url: "https://x.test/file".into(),
+            body: BodyKind::Binary {
+                path: file.clone(),
+                content_type: Some("application/json".into()),
+            },
+            ..Default::default()
+        },
+        RequestDraft {
+            method: Method::Post,
+            url: "https://x.test/upload".into(),
+            body: BodyKind::FormData {
+                fields: vec![
+                    FormField {
+                        description: "说明".into(),
+                        ..FormField::text("note", "hi")
+                    },
+                    FormField::file("doc", file.clone()),
+                    FormField::file("pending", PathBuf::new()),
+                ],
+            },
+            ..Default::default()
+        },
+        RequestDraft::default(),
+    ];
+    for draft in drafts {
+        cx.update(|window, cx| {
+            tab.update(cx, |t, cx| {
+                t.load_draft(&draft, window, cx);
+                assert_eq!(t.draft(cx), draft);
+            })
+        });
+        // 置脏可能来自订阅回调，在事件循环跑空之后再看才靠得住，
+        // 而不是在同一个 cx.update 闭包里立刻读 t.dirty。
+        cx.run_until_parked();
+        assert!(
+            !cx.read(|app| tab.read(app).dirty),
+            "programmatic load must not dirty the tab"
+        );
+    }
+}
+
+#[gpui_kit::test]
+fn form_data_mode_warns_when_user_sets_content_type(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let tab = new_tab(cx);
+    cx.update(|window, cx| {
+        tab.update(cx, |t, cx| {
+            t.body_mode = BodyMode::FormData;
+            t.refresh_body_hint(cx);
+            assert_eq!(t.body_hint, None);
+            let headers = t.headers.clone();
+            headers.update(cx, |h, cx| {
+                h.set_values(&[KeyValue::new("content-type", "text/plain")], window, cx)
+            });
+            t.refresh_body_hint(cx);
+            assert_eq!(t.body_hint, Some(BodyHint::FormDataContentType));
+            // 禁用那一行：提示消失
+            headers.update(cx, |h, cx| {
+                h.set_values(
+                    &[KeyValue {
+                        enabled: false,
+                        ..KeyValue::new("content-type", "text/plain")
+                    }],
+                    window,
+                    cx,
+                )
+            });
+            t.refresh_body_hint(cx);
+            assert_eq!(t.body_hint, None);
+            // 其他模式不提示
+            headers.update(cx, |h, cx| {
+                h.set_values(&[KeyValue::new("Content-Type", "text/plain")], window, cx)
+            });
+            t.body_mode = BodyMode::Raw;
+            t.refresh_body_hint(cx);
+            assert_eq!(t.body_hint, None);
+        })
+    });
+}
+
+#[gpui_kit::test]
+fn form_data_and_urlencoded_tables_are_independent(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let tab = new_tab(cx);
+    cx.update(|window, cx| {
+        tab.update(cx, |t, cx| {
+            t.load_draft(
+                &RequestDraft {
+                    body: BodyKind::FormUrlEncoded {
+                        fields: vec![KeyValue::new("a", "1")],
+                    },
+                    ..Default::default()
+                },
+                window,
+                cx,
+            );
+            t.body_mode = BodyMode::FormData;
+            assert_eq!(t.draft(cx).body, BodyKind::FormData { fields: vec![] });
+            t.body_mode = BodyMode::FormUrlEncoded;
+            assert_eq!(
+                t.draft(cx).body,
+                BodyKind::FormUrlEncoded {
+                    fields: vec![KeyValue::new("a", "1")]
+                }
+            );
+        })
+    });
+}
+
+#[gpui_kit::test]
+fn edits_mark_tab_dirty_and_title_prefers_saved_name(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let tab = new_tab(cx);
+    cx.read(|app| assert!(!tab.read(app).dirty));
+    change_url(&tab, "https://api.test/users/1", cx);
+    cx.update(|_, cx| {
+        tab.update(cx, |t, cx| {
+            assert!(t.dirty);
+            assert_eq!(t.title(cx).as_ref(), "/users/1");
+            t.saved_name = Some("用户详情".into());
+            assert_eq!(t.title(cx).as_ref(), "用户详情");
+            t.mark_clean(cx);
+            assert!(!t.dirty);
+        })
+    });
+}
+
+#[gpui_kit::test]
+fn draft_autosaves_after_debounce(cx: &mut TestAppContext) {
+    let (cx, store, _dir) = init_with_store(cx);
+    let tab = new_tab(cx);
+    let id = cx.read(|app| tab.read(app).id);
+    change_url(&tab, "https://api.test/a", cx);
+    change_url(&tab, "https://api.test/ab", cx);
+    // 去抖窗口未到：还没有任何草稿写入
+    cx.run_until_parked();
+    assert!(store.flush());
+    assert!(read_draft(&store, id).is_none());
+
+    cx.executor().advance_clock(DRAFT_DEBOUNCE);
+    cx.run_until_parked();
+    assert!(store.flush());
+    let draft = read_draft(&store, id).expect("draft file written after debounce");
+    assert_eq!(draft.draft.url, "https://api.test/ab");
+    assert!(draft.dirty);
+    assert_eq!(draft.saved_id, None);
+    // 快照只做一次：两次键入只产生一个草稿写入
+    assert_eq!(store.write_count(), 1);
+}
+
+#[gpui_kit::test]
+fn new_tab_writes_draft_and_close_deletes_it(cx: &mut TestAppContext) {
+    let (cx, store, _dir) = init_with_store(cx);
+    let ws = cx.update(|window, cx| cx.new(|cx| Workspace::new(window, cx)));
+    let (first, second) = cx.update(|window, cx| {
+        ws.update(cx, |ws, cx| {
+            let first = ws.active_tab().read(cx).id;
+            ws.new_tab(window, cx);
+            (first, ws.active_tab().read(cx).id)
+        })
+    });
+    assert!(store.flush());
+    assert!(read_draft(&store, first).is_some());
+    assert!(read_draft(&store, second).is_some());
+
+    cx.update(|window, cx| ws.update(cx, |ws, cx| ws.close_tab(1, window, cx)));
+    assert!(store.flush());
+    assert!(read_draft(&store, first).is_some());
+    assert!(read_draft(&store, second).is_none());
+
+    // 关掉最后一个：旧草稿删除，新空 Tab 的草稿出现
+    cx.update(|window, cx| ws.update(cx, |ws, cx| ws.close_tab(0, window, cx)));
+    let third = cx.read(|app| ws.read(app).active_tab().read(app).id);
+    assert!(store.flush());
+    assert!(read_draft(&store, first).is_none());
+    assert!(read_draft(&store, third).is_some());
+}
+
+#[gpui_kit::test]
+fn without_store_edits_are_harmless(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let ws = cx.update(|window, cx| cx.new(|cx| Workspace::new(window, cx)));
+    let tab = cx.read(|app| ws.read(app).active_tab());
+    change_url(&tab, "https://api.test/x", cx);
+    cx.executor().advance_clock(DRAFT_DEBOUNCE);
+    cx.run_until_parked();
+    cx.update(|window, cx| ws.update(cx, |ws, cx| ws.close_tab(0, window, cx)));
+    cx.read(|app| assert_eq!(ws.read(app).tab_count(), 1));
+}
+
+#[gpui_kit::test]
+fn restore_rebuilds_tabs_from_prepared_root(cx: &mut TestAppContext) {
+    let (cx, store, _dir) = init_with_store(cx);
+    let ids: Vec<Ulid> = (0..3).map(|_| Ulid::generate()).collect();
+    for (i, id) in ids.iter().enumerate() {
+        store.write_draft(TabDraft {
+            id: *id,
+            draft: RequestDraft {
+                url: format!("https://api.test/{i}"),
+                ..Default::default()
+            },
+            saved_id: None,
+            dirty: i == 1,
+        });
+    }
+    store.write_workspace(WorkspaceState {
+        tab_order: vec![ids[2], ids[0], ids[1]],
+        active: Some(ids[0]),
+        sidebar_width: Some(300.),
+        sidebar_collapsed: false,
+        theme: ThemePref::Dark,
+        split: SplitDirection::Horizontal,
+        tab_rows: 1,
+    });
+    assert!(store.flush());
+    let loaded = store.load_all();
+    assert!(loaded.errors.is_empty(), "{:?}", loaded.errors);
+
+    let ws = cx.update(|window, cx| cx.new(|cx| Workspace::restore(loaded, window, cx)));
+    cx.read(|app| {
+        let ws = ws.read(app);
+        let urls: Vec<String> = (0..ws.tab_count())
+            .map(|i| ws.tab_at(i).read(app).url.read(app).value().to_string())
+            .collect();
+        assert_eq!(
+            urls,
+            [
+                "https://api.test/2",
+                "https://api.test/0",
+                "https://api.test/1"
+            ]
+        );
+        assert_eq!(ws.active_index(), 1);
+        assert_eq!(ws.tab_at(1).read(app).id, ids[0]);
+        assert!(ws.tab_at(2).read(app).dirty);
+        assert!(!ws.tab_at(1).read(app).dirty);
+        // 文件里写的是展开（与默认值相反），证明读的是文件而不是默认
+        assert!(!ws.sidebar_collapsed());
+        assert_eq!(ws.sidebar_width(), Some(300.));
+        assert_eq!(ws.theme(), ThemePref::Dark);
+        assert_eq!(ws.split(), SplitDirection::Horizontal);
+        assert_eq!(ws.tab_at(0).read(app).split, SplitDirection::Horizontal);
+        assert!(app.theme().mode.is_dark());
+    });
+}
+
+#[gpui_kit::test]
+fn restore_without_files_creates_one_tab(cx: &mut TestAppContext) {
+    let (cx, store, _dir) = init_with_store(cx);
+    let loaded = store.load_all();
+    let ws = cx.update(|window, cx| cx.new(|cx| Workspace::restore(loaded, window, cx)));
+    cx.read(|app| {
+        let ws = ws.read(app);
+        assert_eq!(ws.tab_count(), 1);
+        assert_eq!(ws.theme(), ThemePref::System);
+        // 首次启动侧栏收成图标栏
+        assert!(ws.sidebar_collapsed());
+    });
+    // 新建的空 Tab 已经有草稿文件
+    let id = cx.read(|app| ws.read(app).active_tab().read(app).id);
+    assert!(store.flush());
+    assert!(read_draft(&store, id).is_some());
+}
+
+#[gpui_kit::test]
+fn restore_clears_orphan_saved_id(cx: &mut TestAppContext) {
+    let (cx, store, _dir) = init_with_store(cx);
+    let id = Ulid::generate();
+    store.write_draft(TabDraft {
+        id,
+        draft: RequestDraft {
+            url: "https://api.test/x".into(),
+            ..Default::default()
+        },
+        saved_id: Some(Ulid::generate()),
+        dirty: false,
+    });
+    assert!(store.flush());
+    let loaded = store.load_all();
+    let ws = cx.update(|window, cx| cx.new(|cx| Workspace::restore(loaded, window, cx)));
+    cx.read(|app| {
+        let tab = ws.read(app).active_tab();
+        let tab = tab.read(app);
+        assert_eq!(tab.id, id);
+        assert_eq!(tab.saved_id, None);
+        assert!(tab.saved_name.is_none());
+        assert!(tab.dirty, "orphaned tab must show as unsaved");
+    });
+}
+
+#[gpui_kit::test]
+fn flush_drafts_writes_every_tab_immediately(cx: &mut TestAppContext) {
+    let (cx, store, _dir) = init_with_store(cx);
+    let ws = cx.update(|window, cx| cx.new(|cx| Workspace::new(window, cx)));
+    let tab = cx.read(|app| ws.read(app).active_tab());
+    change_url(&tab, "https://api.test/unflushed", cx);
+    // 不推进虚拟时钟：去抖任务还没触发，由 flush_on_exit 兜底
+    cx.update(|_, cx| store::flush_on_exit(&ws, cx));
+    let id = cx.read(|app| tab.read(app).id);
+    assert_eq!(
+        read_draft(&store, id).unwrap().draft.url,
+        "https://api.test/unflushed"
+    );
+}
+
+#[gpui_kit::test]
+fn workspace_changes_are_persisted(cx: &mut TestAppContext) {
+    let (cx, store, _dir) = init_with_store(cx);
+    let ws = cx.update(|window, cx| cx.new(|cx| Workspace::new(window, cx)));
+    cx.update(|window, cx| {
+        ws.update(cx, |ws, cx| {
+            ws.new_tab(window, cx);
+            ws.activate(0, cx);
+            ws.toggle_sidebar(cx);
+            ws.set_theme(ThemePref::Dark, window, cx);
+        })
+    });
+    assert!(store.flush());
+    let state = read_workspace(&store).expect("workspace.json written");
+    cx.read(|app| {
+        let ws = ws.read(app);
+        assert_eq!(
+            state.tab_order,
+            vec![ws.tab_at(0).read(app).id, ws.tab_at(1).read(app).id]
+        );
+        assert_eq!(state.active, Some(ws.tab_at(0).read(app).id));
+        assert!(app.theme().mode.is_dark());
+    });
+    // 默认收起，toggle 一次后是展开
+    assert!(!state.sidebar_collapsed);
+    assert_eq!(state.theme, ThemePref::Dark);
+    assert_eq!(state.sidebar_width, None);
+
+    // 关闭 Tab 后顺序与激活项随之更新
+    cx.update(|window, cx| ws.update(cx, |ws, cx| ws.close_tab(0, window, cx)));
+    assert!(store.flush());
+    let state = read_workspace(&store).unwrap();
+    let remaining = cx.read(|app| ws.read(app).tab_at(0).read(app).id);
+    assert_eq!(state.tab_order, vec![remaining]);
+    assert_eq!(state.active, Some(remaining));
+}
+
+#[gpui_kit::test]
+fn cycle_theme_walks_system_light_dark(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let ws = cx.update(|window, cx| cx.new(|cx| Workspace::new(window, cx)));
+    cx.update(|window, cx| {
+        ws.update(cx, |ws, cx| {
+            assert_eq!(ws.theme(), ThemePref::System);
+            ws.cycle_theme(window, cx);
+            assert_eq!(ws.theme(), ThemePref::Light);
+            assert!(!cx.theme().mode.is_dark());
+            ws.cycle_theme(window, cx);
+            assert_eq!(ws.theme(), ThemePref::Dark);
+            assert!(cx.theme().mode.is_dark());
+            ws.cycle_theme(window, cx);
+            assert_eq!(ws.theme(), ThemePref::System);
+        })
+    });
+}
+
+/// 主题偏好在 System / Light / Dark 之间循环时，每一档都必须还是 Germal 的配色。
+/// `Theme::change` 会整套重刷 ThemeColor，若配色只是切换后打的补丁就会在这里丢掉。
+#[gpui_kit::test]
+fn cycling_theme_keeps_the_germal_palette(cx: &mut TestAppContext) {
+    fn hex(color: gpui_kit::Hsla) -> u32 {
+        let rgba = gpui_kit::Rgba::from(color);
+        let to8 = |v: f32| (v * 255.0).round() as u32;
+        (to8(rgba.r) << 16) | (to8(rgba.g) << 8) | to8(rgba.b)
+    }
+
+    let cx = init(cx);
+    let ws = cx.update(|window, cx| cx.new(|cx| Workspace::new(window, cx)));
+    cx.update(|window, cx| {
+        ws.update(cx, |ws, cx| {
+            for _ in 0..4 {
+                ws.cycle_theme(window, cx);
+                let expected = if cx.theme().mode.is_dark() {
+                    0x6fa8d4
+                } else {
+                    0x3f87bd
+                };
+                assert_eq!(
+                    hex(cx.theme().primary),
+                    expected,
+                    "主题切到 {:?} 后丢失了 Germal 配色",
+                    ws.theme()
+                );
+            }
+        })
+    });
+}
+
+#[gpui_kit::test]
+fn finish_save_writes_request_file_and_marks_tab_clean(cx: &mut TestAppContext) {
+    let (cx, store, _dir) = init_with_store(cx);
+    let ws = cx.update(|window, cx| cx.new(|cx| Workspace::new(window, cx)));
+    let tab = cx.read(|app| ws.read(app).active_tab());
+    change_url(&tab, "https://api.test/users", cx);
+    cx.read(|app| assert!(tab.read(app).dirty));
+
+    let id = cx
+        .update(|_, cx| {
+            ws.update(cx, |ws, cx| {
+                ws.finish_save(tab.clone(), "  用户列表 ".into(), None, cx)
+            })
+        })
+        .expect("tab still open");
+    assert!(store.flush());
+    let req = read_request(&store, id).expect("requests/<ulid>.json written");
+    assert_eq!(req.name, "用户列表");
+    assert_eq!(req.draft.url, "https://api.test/users");
+    assert_eq!(req.draft.method, Method::Get);
+    assert_eq!(req.created_at, req.updated_at);
+    cx.read(|app| {
+        let ws = ws.read(app);
+        assert_eq!(ws.saved().len(), 1);
+        let t = tab.read(app);
+        assert_eq!(t.saved_id, Some(id));
+        assert!(!t.dirty);
+        assert_eq!(t.title(app).as_ref(), "用户列表");
+    });
+    // 草稿文件也记录了来源与干净状态
+    let tab_id = cx.read(|app| tab.read(app).id);
+    let draft = read_draft(&store, tab_id).unwrap();
+    assert_eq!((draft.saved_id, draft.dirty), (Some(id), false));
+}
+
+/// 保存时带分类：finish_save 的 group 参数进文件，分类列表随之出现。
+#[gpui_kit::test]
+fn saving_with_a_group_persists_it(cx: &mut TestAppContext) {
+    let (cx, store, _dir) = init_with_store(cx);
+    let ws = cx.update(|window, cx| cx.new(|cx| Workspace::new(window, cx)));
+    let tab = cx.read(|app| ws.read(app).active_tab());
+    change_url(&tab, "https://api.test/a", cx);
+    cx.update(|_, cx| {
+        ws.update(cx, |ws, cx| {
+            ws.finish_save(tab.clone(), "甲".into(), Some("订单".into()), cx)
+        })
+    })
+    .unwrap();
+    assert!(store.flush());
+    let loaded = store.load_all();
+    assert_eq!(loaded.requests[0].group.as_deref(), Some("订单"));
+    // ⌘S 覆盖：分类不变（overwrite_saved 路径不碰 group）
+    change_url(&tab, "https://api.test/a2", cx);
+    cx.update(|window, cx| ws.update(cx, |ws, cx| ws.save_active(window, cx)));
+    assert!(store.flush());
+    let loaded = store.load_all();
+    assert_eq!(loaded.requests[0].group.as_deref(), Some("订单"));
+    assert_eq!(loaded.requests[0].draft.url, "https://api.test/a2");
+}
+
+/// F3：保存对话框在用户关闭 Tab 之后才确认——`finish_save` 必须是 no-op，
+/// 不能凭空写出请求文件，也不能复活已随 close_tab 删除的草稿文件。
+#[gpui_kit::test]
+fn finish_save_on_closed_tab_is_noop(cx: &mut TestAppContext) {
+    let (cx, store, _dir) = init_with_store(cx);
+    let ws = cx.update(|window, cx| cx.new(|cx| Workspace::new(window, cx)));
+    cx.update(|window, cx| ws.update(cx, |ws, cx| ws.new_tab(window, cx)));
+    let tab = cx.read(|app| ws.read(app).tab_at(1));
+    let tab_id = cx.read(|app| tab.read(app).id);
+    cx.update(|window, cx| ws.update(cx, |ws, cx| ws.close_tab(1, window, cx)));
+
+    let result = cx.update(|_, cx| {
+        ws.update(cx, |ws, cx| {
+            ws.finish_save(tab.clone(), "x".into(), None, cx)
+        })
+    });
+    assert!(result.is_none());
+    assert!(store.flush());
+    assert_eq!(request_files(&store), 0);
+    assert!(read_draft(&store, tab_id).is_none());
+}
+
+#[gpui_kit::test]
+fn save_active_overwrites_existing_without_prompt(cx: &mut TestAppContext) {
+    let (cx, store, _dir) = init_with_store(cx);
+    let ws = cx.update(|window, cx| cx.new(|cx| Workspace::new(window, cx)));
+    let tab = cx.read(|app| ws.read(app).active_tab());
+    change_url(&tab, "https://api.test/v1", cx);
+    let id = cx
+        .update(|_, cx| {
+            ws.update(cx, |ws, cx| {
+                ws.finish_save(tab.clone(), "接口".into(), None, cx)
+            })
+        })
+        .unwrap();
+    // 真实时钟前进，让 updated_at 可区分
+    std::thread::sleep(Duration::from_millis(2));
+    change_url(&tab, "https://api.test/v2", cx);
+    cx.read(|app| assert!(tab.read(app).dirty));
+
+    // 已有 saved_id：直接覆盖，不弹对话框（测试窗口没有 Root，若弹窗会 panic）
+    cx.update(|window, cx| ws.update(cx, |ws, cx| ws.save_active(window, cx)));
+    assert!(store.flush());
+    assert_eq!(request_files(&store), 1);
+    let req = read_request(&store, id).unwrap();
+    assert_eq!(req.name, "接口");
+    assert_eq!(req.draft.url, "https://api.test/v2");
+    assert!(req.updated_at > req.created_at);
+    cx.read(|app| {
+        assert!(!tab.read(app).dirty);
+        assert_eq!(ws.read(app).saved()[0].id, id);
+    });
+}
+
+#[gpui_kit::test]
+fn empty_name_falls_back_to_tab_title(cx: &mut TestAppContext) {
+    let (cx, store, _dir) = init_with_store(cx);
+    let ws = cx.update(|window, cx| cx.new(|cx| Workspace::new(window, cx)));
+    let tab = cx.read(|app| ws.read(app).active_tab());
+    change_url(&tab, "https://api.test/users/42", cx);
+    let id = cx
+        .update(|_, cx| {
+            ws.update(cx, |ws, cx| {
+                ws.finish_save(tab.clone(), "   ".into(), None, cx)
+            })
+        })
+        .unwrap();
+    assert!(store.flush());
+    assert_eq!(read_request(&store, id).unwrap().name, "/users/42");
+}
+
+#[gpui_kit::test]
+fn open_saved_opens_tab_then_focuses_existing(cx: &mut TestAppContext) {
+    let (cx, store, _dir) = init_with_store(cx);
+    let ws = cx.update(|window, cx| cx.new(|cx| Workspace::new(window, cx)));
+    let tab = cx.read(|app| ws.read(app).active_tab());
+    change_url(&tab, "https://api.test/items/7", cx);
+    let id = cx
+        .update(|_, cx| {
+            ws.update(cx, |ws, cx| {
+                ws.finish_save(tab.clone(), "条目".into(), None, cx)
+            })
+        })
+        .unwrap();
+    // 关掉这个 Tab（自动补一个空 Tab），再从侧栏打开
+    cx.update(|window, cx| ws.update(cx, |ws, cx| ws.close_tab(0, window, cx)));
+    cx.update(|window, cx| ws.update(cx, |ws, cx| ws.open_saved(id, window, cx)));
+    cx.read(|app| {
+        let ws = ws.read(app);
+        assert_eq!(ws.tab_count(), 2);
+        assert_eq!(ws.active_index(), 1);
+        let t = ws.active_tab();
+        let t = t.read(app);
+        assert_eq!(t.saved_id, Some(id));
+        assert_eq!(t.title(app).as_ref(), "条目");
+        assert_eq!(t.url.read(app).value().as_ref(), "https://api.test/items/7");
+        assert!(!t.dirty);
+    });
+    // 再次打开同一条：聚焦已有 Tab，不新建
+    cx.update(|window, cx| {
+        ws.update(cx, |ws, cx| {
+            ws.activate(0, cx);
+            ws.open_saved(id, window, cx);
+        })
+    });
+    cx.read(|app| {
+        let ws = ws.read(app);
+        assert_eq!(ws.tab_count(), 2);
+        assert_eq!(ws.active_index(), 1);
+    });
+    // 打开的 Tab 的草稿记录了来源
+    let opened = cx.read(|app| ws.read(app).active_tab().read(app).id);
+    assert!(store.flush());
+    assert_eq!(read_draft(&store, opened).unwrap().saved_id, Some(id));
+    // 不存在的 id：no-op
+    cx.update(|window, cx| ws.update(cx, |ws, cx| ws.open_saved(Ulid::generate(), window, cx)));
+    cx.read(|app| assert_eq!(ws.read(app).tab_count(), 2));
+}
+
+#[gpui_kit::test]
+fn open_template_prefills_a_new_tab(cx: &mut TestAppContext) {
+    let (cx, _store, _dir) = init_with_store(cx);
+    let ws = cx.update(|window, cx| cx.new(|cx| Workspace::new(window, cx)));
+    let template = crate::templates::find("openai-chat-vision").unwrap();
+
+    cx.update(|window, cx| {
+        ws.update(cx, |ws, cx| {
+            ws.open_template("openai-chat-vision", window, cx)
+        })
+    });
+    cx.read(|app| {
+        let ws = ws.read(app);
+        assert_eq!(ws.tab_count(), 2, "模板开在新 Tab 里，不覆盖原有的");
+        let t = ws.active_tab();
+        let t = t.read(app);
+        let draft = t.draft(app);
+        assert_eq!(draft.method, Method::Post);
+        assert_eq!(draft.url, template.url);
+        assert_eq!(draft.headers.len(), template.headers.len());
+        assert!(
+            draft
+                .headers
+                .iter()
+                .any(|h| h.key == "Authorization" && h.value == "Bearer YOUR_API_KEY")
+        );
+        match draft.body {
+            BodyKind::Raw { format, ref text } => {
+                assert_eq!(format, RawFormat::Json);
+                assert_eq!(text, template.body, "请求体应原样进编辑器");
+            }
+            ref other => panic!("期望 Raw JSON，实际 {other:?}"),
+        }
+        // 模板产出的是全新未保存请求；标题走 URL 末段，saved_name 只属于真保存过的
+        assert!(t.saved_id.is_none());
+        assert!(t.saved_name.is_none());
+        assert!(t.dirty);
+        assert_eq!(t.title(app).as_ref(), "/v1/chat/completions");
+    });
+
+    // 同一个模板允许再开一份（不像 open_saved 那样聚焦已有 Tab）
+    cx.update(|window, cx| {
+        ws.update(cx, |ws, cx| {
+            ws.open_template("openai-chat-vision", window, cx)
+        })
+    });
+    cx.read(|app| assert_eq!(ws.read(app).tab_count(), 3));
+
+    // 不存在的 id：no-op
+    cx.update(|window, cx| ws.update(cx, |ws, cx| ws.open_template("nope", window, cx)));
+    cx.read(|app| assert_eq!(ws.read(app).tab_count(), 3));
+}
+
+#[gpui_kit::test]
+fn duplicate_active_copies_content_next_to_the_source(cx: &mut TestAppContext) {
+    let (cx, _store, _dir) = init_with_store(cx);
+    let ws = cx.update(|window, cx| cx.new(|cx| Workspace::new(window, cx)));
+
+    // 攒出 [空, 模板, 空] 三个 Tab：复制中间那个，插入位置才看得出来
+    cx.update(|window, cx| {
+        ws.update(cx, |ws, cx| {
+            ws.open_template("openai-chat-vision", window, cx);
+            ws.new_tab(window, cx);
+            ws.activate(1, cx);
+        })
+    });
+
+    // 给源挂上 saved_id，才测得出副本没有继承它
+    let source = cx.read(|app| ws.read(app).tab_at(1));
+    let saved_id = Ulid::generate();
+    cx.update(|_, cx| {
+        source.update(cx, |t, _| {
+            t.saved_id = Some(saved_id);
+            t.dirty = false;
+        })
+    });
+    let (source_draft, source_id) = cx.read(|app| {
+        let t = source.read(app);
+        (t.draft(app), t.id)
+    });
+
+    cx.update(|window, cx| ws.update(cx, |ws, cx| ws.duplicate_active(window, cx)));
+
+    cx.read(|app| {
+        let ws = ws.read(app);
+        assert_eq!(ws.tab_count(), 4);
+        // 副本紧跟在源右边，而不是被追加到末尾
+        assert_eq!(ws.active_index(), 2);
+        let copy = ws.tab_at(2);
+        let copy = copy.read(app);
+        assert_eq!(copy.draft(app), source_draft, "填过的内容要原样带过来");
+        // 副本是全新的未保存请求：继承 saved_id 的话两个 Tab 会互相覆盖对方的保存
+        assert!(copy.saved_id.is_none());
+        assert!(copy.dirty);
+        assert_ne!(copy.id, source_id, "草稿文件名必须是新的，不能共用");
+        // 源本身不受影响
+        let src = ws.tab_at(1);
+        let src = src.read(app);
+        assert_eq!(src.saved_id, Some(saved_id));
+        assert!(!src.dirty);
+    });
+}
+
+#[gpui_kit::test]
+fn duplicate_active_on_the_last_tab_appends(cx: &mut TestAppContext) {
+    let (cx, _store, _dir) = init_with_store(cx);
+    let ws = cx.update(|window, cx| cx.new(|cx| Workspace::new(window, cx)));
+    // 只有一个 Tab 时「插到源右边」就是末尾，不该把下标算错
+    cx.update(|window, cx| ws.update(cx, |ws, cx| ws.duplicate_active(window, cx)));
+    cx.read(|app| {
+        let ws = ws.read(app);
+        assert_eq!((ws.tab_count(), ws.active_index()), (2, 1));
+    });
+}
+
+#[gpui_kit::test]
+fn template_panel_switches_and_draws(cx: &mut TestAppContext) {
+    let (cx, _store, _dir) = init_with_store(cx);
+    let ws = cx.update(|window, cx| cx.new(|cx| Workspace::new(window, cx)));
+
+    // 图标栏点「模板」：展开面板并切过去
+    cx.update(|_, cx| {
+        ws.update(cx, |ws, cx| {
+            ws.open_sidebar_section(SidebarSection::Templates, cx)
+        })
+    });
+    cx.read(|app| {
+        let ws = ws.read(app);
+        assert_eq!(ws.sidebar_section(), SidebarSection::Templates);
+        assert!(!ws.sidebar_collapsed());
+    });
+
+    // 真正绘制一帧：模板行是手工平铺的，element id 冲突或借用错误只有在布局时才暴露。
+    // blur 的原因同 sidebar_lists_newest_first_and_draws_rows。
+    cx.update(|window, cx| window.blur(cx));
+    let ws_element = ws.clone();
+    cx.draw(point(px(0.), px(0.)), size(px(1200.), px(800.)), |_, _| {
+        ws_element.into_any_element()
+    });
+
+    // 再点同一个图标：收起
+    cx.update(|_, cx| {
+        ws.update(cx, |ws, cx| {
+            ws.open_sidebar_section(SidebarSection::Templates, cx)
+        })
+    });
+    cx.read(|app| assert!(ws.read(app).sidebar_collapsed()));
+}
+
+/// 标签多到溢出时，标签栏要多渲染箭头、溢出菜单和末尾占位。这些都只在真实布局
+/// 阶段才组装，`cargo check` 抓不到 element id 冲突之类的问题，所以画一帧。
+#[gpui_kit::test]
+fn tab_bar_draws_with_many_tabs(cx: &mut TestAppContext) {
+    let (cx, _store, _dir) = init_with_store(cx);
+    let ws = cx.update(|window, cx| cx.new(|cx| Workspace::new(window, cx)));
+    for _ in 0..12 {
+        cx.update(|window, cx| ws.update(cx, |ws, cx| ws.new_tab(window, cx)));
+    }
+    cx.read(|app| {
+        let ws = ws.read(app);
+        assert_eq!(ws.tab_count(), 13);
+        assert_eq!(ws.active_index(), 12, "新建后激活最后一个");
+    });
+
+    // blur 的原因同 sidebar_lists_newest_first_and_draws_rows
+    cx.update(|window, cx| window.blur(cx));
+    let ws_element = ws.clone();
+    cx.draw(point(px(0.), px(0.)), size(px(900.), px(600.)), |_, _| {
+        ws_element.into_any_element()
+    });
+
+    // 画过一帧后布局才算出溢出量，这时箭头才有意义
+    cx.update(|_, cx| {
+        ws.update(cx, |ws, cx| {
+            ws.step_tabs(1, cx);
+            ws.step_tabs(-1, cx);
+            // 反复滚到头也不该把偏移推出边界
+            for _ in 0..20 {
+                ws.step_tabs(-1, cx);
+            }
+        })
+    });
+    cx.draw(point(px(0.), px(0.)), size(px(900.), px(600.)), |_, _| {
+        ws.clone().into_any_element()
+    });
+}
+
+/// 图标栏的 Button id 用 `section as usize`，面板切换也按数组下标走：
+/// `ALL` 的顺序一旦与变体声明顺序错开，点第二个图标会展开第一个面板。
+#[test]
+fn sidebar_sections_are_indexed_by_discriminant() {
+    for (ix, section) in SidebarSection::ALL.iter().enumerate() {
+        assert_eq!(*section as usize, ix, "ALL[{ix}] 与判别值对不上");
+    }
+}
+
+/// 右侧图标栏同理：Button id 用 `section as usize`，顺序错开就会点错功能。
+#[test]
+fn tool_sections_are_indexed_by_discriminant() {
+    for (ix, section) in ToolSection::ALL.iter().enumerate() {
+        assert_eq!(*section as usize, ix, "ALL[{ix}] 与判别值对不上");
+    }
+}
+
+/// 抽屉里的代码来自**当前** Tab：切了 Tab 再打开，看到的必须是新那条请求。
+#[gpui_kit::test]
+fn code_sheet_generates_from_the_active_tab(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let ws = cx.update(|window, cx| cx.new(|cx| Workspace::new(window, cx)));
+
+    let first = cx.read(|app| ws.read(app).active_tab());
+    change_url(&first, "https://api.test/v1/first", cx);
+    cx.update(|window, cx| ws.update(cx, |ws, cx| ws.refresh_code_sheet(window, cx)));
+    let code = cx.read(|app| ws.read(app).code_sheet.read(app).text().clone());
+    assert!(
+        code.contains("curl -X GET 'https://api.test/v1/first'"),
+        "{code}"
+    );
+    assert!(cx.read(|app| ws.read(app).code_sheet.read(app).error().is_none()));
+
+    cx.update(|window, cx| ws.update(cx, |ws, cx| ws.new_tab(window, cx)));
+    let second = cx.read(|app| ws.read(app).active_tab());
+    change_url(&second, "https://api.test/v2/second", cx);
+    cx.update(|window, cx| ws.update(cx, |ws, cx| ws.refresh_code_sheet(window, cx)));
+    let code = cx.read(|app| ws.read(app).code_sheet.read(app).text().clone());
+    assert!(code.contains("https://api.test/v2/second"), "{code}");
+    assert!(
+        !code.contains("v1/first"),
+        "还留着上一个 Tab 的内容：{code}"
+    );
+}
+
+/// 切换生成目标要重新生成，而不是把旧代码留在编辑器里。
+#[gpui_kit::test]
+fn switching_the_target_regenerates_the_code(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let ws = cx.update(|window, cx| cx.new(|cx| Workspace::new(window, cx)));
+    let tab = cx.read(|app| ws.read(app).active_tab());
+    change_url(&tab, "https://api.test/ping", cx);
+    cx.update(|window, cx| ws.update(cx, |ws, cx| ws.refresh_code_sheet(window, cx)));
+    assert!(cx.read(|app| ws.read(app).code_sheet.read(app).text().starts_with("curl")));
+
+    cx.update(|window, cx| {
+        ws.read(cx).code_sheet.clone().update(cx, |sheet, cx| {
+            sheet.set_target_for_test(CodeTarget::PythonRequests, window, cx)
+        })
+    });
+    let code = cx.read(|app| ws.read(app).code_sheet.read(app).text().clone());
+    assert!(code.starts_with("import requests"), "{code}");
+    assert_eq!(
+        cx.read(|app| ws.read(app).code_sheet.read(app).target()),
+        CodeTarget::PythonRequests
+    );
+}
+
+/// 抽屉正文必须是**能独立渲染的实体**。
+///
+/// 它由 `Sheet` 的 builder 在 `Workspace::render` 内部渲染；一旦有人把它改回
+/// `Workspace` 上的 render 方法（builder 里 `workspace.update(...)`），运行时就会
+/// 二次借用 Workspace 而 panic「cannot update Workspace while it is already being
+/// updated」，表现为点一下右侧图标栏就闪退。
+///
+/// 真实的 `Root` 窗口在测试里建不起来（`Root::new` 要装 macOS hit-test 转发器，
+/// 需要真实 NSView），所以这里钉的是结构：CodeSheet 自己就是 `Render`，
+/// 单独画一帧不碰 Workspace。改回去会直接编译失败。
+#[gpui_kit::test]
+fn code_sheet_renders_without_touching_the_workspace(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let ws = cx.update(|window, cx| cx.new(|cx| Workspace::new(window, cx)));
+    let tab = cx.read(|app| ws.read(app).active_tab());
+    change_url(&tab, "https://api.test/ping", cx);
+    cx.update(|window, cx| ws.update(cx, |ws, cx| ws.refresh_code_sheet(window, cx)));
+
+    let sheet = cx.read(|app| ws.read(app).code_sheet.clone());
+    cx.update(|window, cx| window.blur(cx));
+    // Workspace 同时被自己的 render 借着，抽屉照样画得出来——这正是修复的要点
+    cx.draw(point(px(0.), px(0.)), size(px(560.), px(700.)), |_, _| {
+        sheet.clone().into_any_element()
+    });
+    cx.draw(point(px(0.), px(0.)), size(px(900.), px(600.)), |_, _| {
+        ws.clone().into_any_element()
+    });
+}
+
+/// URL 还没填就打开抽屉：给一段占位骨架，而不是一条红字。
+/// 新建 Tab 本来就是空 URL，报错会让人以为是自己弄坏了什么。
+#[gpui_kit::test]
+fn an_unfilled_url_shows_a_placeholder_skeleton(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let ws = cx.update(|window, cx| cx.new(|cx| Workspace::new(window, cx)));
+    cx.update(|window, cx| ws.update(cx, |ws, cx| ws.refresh_code_sheet(window, cx)));
+    cx.read(|app| {
+        let sheet = ws.read(app).code_sheet.read(app);
+        assert!(sheet.error().is_none(), "空 URL 不该报错");
+        assert!(sheet.text().contains(PLACEHOLDER_URL), "{}", sheet.text());
+    });
+}
+
+/// 但真填错了还是要报出来——那不是「还没填」，是需要用户去改。
+#[gpui_kit::test]
+fn a_malformed_url_still_shows_the_error(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let ws = cx.update(|window, cx| cx.new(|cx| Workspace::new(window, cx)));
+    let tab = cx.read(|app| ws.read(app).active_tab());
+    change_url(&tab, "ftp://files.example.com", cx);
+    cx.update(|window, cx| ws.update(cx, |ws, cx| ws.refresh_code_sheet(window, cx)));
+    cx.read(|app| {
+        let sheet = ws.read(app).code_sheet.read(app);
+        assert!(matches!(sheet.error(), Some(RequestError::InvalidUrl(_))));
+        assert!(sheet.text().is_empty(), "报错时不该留着上一次的代码");
+    });
+}
+
+/// 默认请求头的开关是全局设置，抽屉每次生成都现取。
+#[gpui_kit::test]
+fn disabling_a_default_header_shows_up_in_the_generated_code(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let ws = cx.update(|window, cx| cx.new(|cx| Workspace::new(window, cx)));
+    let tab = cx.read(|app| ws.read(app).active_tab());
+    change_url(&tab, "https://api.test/ping", cx);
+
+    cx.update(|window, cx| ws.update(cx, |ws, cx| ws.refresh_code_sheet(window, cx)));
+    assert!(cx.read(|app| {
+        ws.read(app)
+            .code_sheet
+            .read(app)
+            .text()
+            .contains("User-Agent")
+    }));
+
+    cx.update(|_, cx| {
+        settings::update(cx, |s| {
+            s.request.disabled_default_headers = vec!["user-agent".into()]
+        })
+    });
+    cx.update(|window, cx| ws.update(cx, |ws, cx| ws.refresh_code_sheet(window, cx)));
+    let code = cx.read(|app| ws.read(app).code_sheet.read(app).text().clone());
+    assert!(!code.contains("User-Agent"), "{code}");
+    assert!(code.contains("Accept"), "其余默认头还在：{code}");
+}
+
+/// 生成的 curl 必须等于真正发出去的请求：变量已展开，但不执行前置操作。
+#[gpui_kit::test]
+fn code_sheet_uses_resolved_variables_without_running_pre_ops(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    cx.update(|_, app| {
+        variables::update(app, |s| s.globals.push(Variable::new("host", "api.test")))
+    });
+    let ws = cx.update(|window, cx| cx.new(|cx| Workspace::new(window, cx)));
+    let tab = cx.read(|app| ws.read(app).active_tab());
+    change_url(&tab, "https://{{host}}/v1", cx);
+    cx.update(|window, cx| {
+        tab.update(cx, |t, cx| {
+            t.pre_ops.update(cx, |o, cx| {
+                o.set_pre_ops(
+                    &[PreOp {
+                        enabled: true,
+                        kind: PreOpKind::SetVariable {
+                            scope: VarScope::Global,
+                            key: "side_effect".into(),
+                            value: "1".into(),
+                        },
+                    }],
+                    window,
+                    cx,
+                )
+            });
+        })
+    });
+    cx.update(|window, cx| ws.update(cx, |ws, cx| ws.refresh_code_sheet(window, cx)));
+    let code = cx.read(|app| ws.read(app).code_sheet.read(app).text().clone());
+    assert!(code.contains("'https://api.test/v1'"), "{code}");
+    cx.read(|app| {
+        assert!(
+            variables::variables(app)
+                .globals
+                .iter()
+                .all(|v| v.key != "side_effect")
+        )
+    });
+}
+
+/// 抽屉：编辑表格写回对应作用域；导入 environment 建新环境、导入 globals 合并；导出能被 parse 读回。
+#[gpui_kit::test]
+fn variables_sheet_edits_import_and_export(cx: &mut TestAppContext) {
+    let (cx, store, _dir) = init_with_store(cx);
+    let sheet = cx.update(|window, cx| cx.new(|cx| VariablesSheet::new(window, cx)));
+    // 全局页：表格改动 → 写回
+    cx.update(|window, cx| {
+        sheet.update(cx, |s, cx| {
+            s.load(SheetScope::Global, None, vec![], window, cx);
+            s.table().update(cx, |t, cx| {
+                t.set_variables(&[Variable::new("host", "h")], window, cx)
+            });
+            s.commit_table_for_test(cx);
+        })
+    });
+    cx.read(|app| assert_eq!(variables::variables(app).globals[0].value, "h"));
+    // 抽屉开着时后台写入变量（模拟响应到达后的提取）：表格跟上，之后的编辑不会把它抹掉
+    cx.update(|_, app| variables::update(app, |s| s.globals.push(Variable::new("token", "T"))));
+    cx.run_until_parked();
+    cx.read(|app| {
+        let keys: Vec<String> = sheet
+            .read(app)
+            .table()
+            .read(app)
+            .variables(app)
+            .into_iter()
+            .map(|v| v.key)
+            .collect();
+        assert_eq!(keys, vec!["host".to_string(), "token".to_string()]);
+    });
+    cx.update(|_, cx| sheet.update(cx, |s, cx| s.commit_table_for_test(cx)));
+    cx.read(|app| {
+        assert!(
+            variables::variables(app)
+                .globals
+                .iter()
+                .any(|v| v.key == "token" && v.value == "T")
+        )
+    });
+    // 导入 environment → 新环境并激活
+    let n = cx
+        .update(|window, cx| {
+            sheet.update(cx, |s, cx| {
+                s.import_from_text(
+                    r#"{"name":"Dev","values":[{"key":"code","value":"200","type":"secret"}],"_postman_variable_scope":"environment"}"#,
+                    window,
+                    cx,
+                )
+            })
+        })
+        .unwrap();
+    assert_eq!(n, 1);
+    cx.read(|app| {
+        let sets = variables::variables(app);
+        assert_eq!(sets.environments[0].name, "Dev");
+        assert!(sets.environments[0].variables[0].secret);
+        assert_eq!(sets.active_environment, Some(sets.environments[0].id));
+    });
+    // 再导一次同名：名字加后缀
+    cx.update(|window, cx| {
+        sheet.update(cx, |s, cx| {
+            s.import_from_text(r#"{"name":"Dev","values":[]}"#, window, cx)
+        })
+    })
+    .unwrap();
+    cx.read(|app| assert_eq!(variables::variables(app).environments[1].name, "Dev 2"));
+    // 导入 globals：合并、同 key 覆盖
+    cx.update(|window, cx| {
+        sheet.update(cx, |s, cx| {
+            s.import_from_text(
+                r#"{"values":[{"key":"host","value":"new"},{"key":"x","value":"1"}],"_postman_variable_scope":"globals"}"#,
+                window,
+                cx,
+            )
+        })
+    })
+    .unwrap();
+    cx.read(|app| {
+        let g = &variables::variables(app).globals;
+        assert_eq!(g.len(), 3);
+        assert_eq!(g.iter().find(|v| v.key == "host").unwrap().value, "new");
+    });
+    // 导出环境页：打开时定位到激活环境（刚导入的 Dev 2），经下拉切回 Dev 再导出
+    cx.update(|window, cx| {
+        sheet.update(cx, |s, cx| {
+            s.load(SheetScope::Environment, None, vec![], window, cx)
+        })
+    });
+    let (name, _) = cx.read(|app| sheet.read(app).export_text(app)).unwrap();
+    assert_eq!(name, "Dev_2.postman_environment.json");
+    let env_select = cx.read(|app| sheet.read(app).env_select().clone());
+    pick_select(cx, &env_select, 0);
+    cx.run_until_parked();
+    let (name, text) = cx.read(|app| sheet.read(app).export_text(app)).unwrap();
+    assert!(name.ends_with(".postman_environment.json"), "{name}");
+    let parsed = germal_core::postman_env::parse(&text).unwrap();
+    assert_eq!(parsed.name, "Dev");
+    assert_eq!(parsed.variables[0].key, "code");
+    assert!(parsed.variables[0].secret);
+    // 分类页没有 Postman 对应格式，不导出
+    cx.update(|window, cx| {
+        sheet.update(cx, |s, cx| {
+            s.load(SheetScope::Group, None, vec!["api".into()], window, cx)
+        })
+    });
+    assert!(cx.read(|app| sheet.read(app).export_text(app)).is_none());
+    // 坏文件报错，不改变量
+    let before = cx.read(|app| variables::variables(app).clone());
+    let err = cx.update(|window, cx| sheet.update(cx, |s, cx| s.import_from_text("{", window, cx)));
+    assert!(err.is_err());
+    cx.read(|app| assert_eq!(*variables::variables(app), before));
+    assert!(store.flush());
+}
+
+/// 文件对话框路径：读文件与解析都在后台线程，结果回到抽屉；文件不对 / 读不出来时提示翻译过的原因；
+/// 导出写出的文件能被 parse 读回。
+#[gpui_kit::test]
+fn variables_sheet_imports_and_exports_through_file_dialogs(cx: &mut TestAppContext) {
+    let _locale = crate::i18n::locale_test_lock();
+    let (cx, _store, dir) = init_with_store(cx);
+    let sheet = cx.update(|window, cx| cx.new(|cx| VariablesSheet::new(window, cx)));
+    cx.update(|window, cx| {
+        sheet.update(cx, |s, cx| {
+            s.load(SheetScope::Global, None, vec![], window, cx)
+        })
+    });
+    let good = dir.path().join("dev.postman_environment.json");
+    std::fs::write(
+        &good,
+        r#"{"name":"Dev","values":[{"key":"code","value":"200","type":"secret"}]}"#,
+    )
+    .unwrap();
+    let collection = dir.path().join("collection.json");
+    std::fs::write(&collection, r#"{"info":{"name":"not an environment"}}"#).unwrap();
+    let import = |cx: &mut VisualTestContext, path: PathBuf| {
+        cx.update(|window, cx| sheet.update(cx, |s, cx| s.import_file_for_test(window, cx)));
+        assert!(cx.did_prompt_for_paths());
+        cx.simulate_path_prompt_response(move |_| Some(vec![path]));
+    };
+    let notice_is = |cx: &mut VisualTestContext, pred: &dyn Fn(&str) -> bool| {
+        cx.read(|app| sheet.read(app).notice_text().is_some_and(|t| pred(&t)))
+    };
+
+    import(cx, good);
+    wait_until(cx, |cx| notice_is(cx, &|t| t == "Variables imported: 1"));
+    cx.read(|app| {
+        let sets = variables::variables(app);
+        assert_eq!(sets.environments[0].name, "Dev");
+        assert!(sets.environments[0].variables[0].secret);
+    });
+
+    // 不是 environment 的 JSON：原因走翻译，不漏 core 的英文 Display
+    import(cx, collection);
+    wait_until(cx, |cx| {
+        notice_is(cx, &|t| {
+            t == "This file isn't a Postman environment or globals export"
+        })
+    });
+    // 读不出来：io 原话保留在 import_failed 里
+    import(cx, dir.path().join("missing.json"));
+    wait_until(cx, |cx| {
+        notice_is(cx, &|t| t.starts_with("Import failed: "))
+    });
+    cx.read(|app| assert_eq!(variables::variables(app).environments.len(), 1));
+
+    // 导出当前页（导入后抽屉停在 Dev 环境页）
+    let dest = dir.path().join("out.postman_environment.json");
+    cx.update(|window, cx| sheet.update(cx, |s, cx| s.export_file_for_test(window, cx)));
+    assert!(cx.did_prompt_for_new_path());
+    let chosen = dest.clone();
+    cx.simulate_new_path_selection(move |_| Some(chosen));
+    wait_until(cx, |cx| notice_is(cx, &|t| t.starts_with("Exported to ")));
+    let parsed = germal_core::postman_env::parse(&std::fs::read_to_string(&dest).unwrap()).unwrap();
+    assert_eq!(parsed.name, "Dev");
+    assert!(parsed.variables[0].secret);
+}
+
+/// 抽屉：下拉切环境换表；改名边打字边写回，观察者不会把输入框重置（尾随空格不被吃掉）；
+/// 分类页写回该分类，清空后不留空条目。
+#[gpui_kit::test]
+fn variables_sheet_switches_renames_and_edits_groups(cx: &mut TestAppContext) {
+    let (cx, store, _dir) = init_with_store(cx);
+    cx.update(|_, app| {
+        variables::update(app, |s| {
+            let mut a = Environment::new("A");
+            a.variables.push(Variable::new("k", "a"));
+            let mut b = Environment::new("B");
+            b.variables.push(Variable::new("k", "b"));
+            s.active_environment = Some(b.id);
+            s.environments = vec![a, b];
+            s.groups
+                .insert("orphan".into(), vec![Variable::new("g", "1")]);
+        })
+    });
+    let sheet = cx.update(|window, cx| cx.new(|cx| VariablesSheet::new(window, cx)));
+    let table_values = |cx: &mut VisualTestContext| {
+        cx.read(|app| {
+            sheet
+                .read(app)
+                .table()
+                .read(app)
+                .variables(app)
+                .into_iter()
+                .map(|v| (v.key, v.value))
+                .collect::<Vec<_>>()
+        })
+    };
+    cx.update(|window, cx| {
+        sheet.update(cx, |s, cx| {
+            s.load(SheetScope::Environment, None, vec![], window, cx)
+        })
+    });
+    // 默认定位到激活环境
+    assert_eq!(table_values(cx), vec![("k".to_string(), "b".to_string())]);
+    let env_select = cx.read(|app| sheet.read(app).env_select().clone());
+    pick_select(cx, &env_select, 0);
+    cx.run_until_parked();
+    assert_eq!(table_values(cx), vec![("k".to_string(), "a".to_string())]);
+
+    // 真实写回路径：表格自己发 `Changed`，经抽屉的订阅写回当前环境（不走 commit_table_for_test）
+    let table = cx.read(|app| sheet.read(app).table().clone());
+    cx.update(|window, cx| table.update(cx, |t, cx| t.set_row_secret(0, true, window, cx)));
+    cx.run_until_parked();
+    cx.read(|app| {
+        let sets = variables::variables(app);
+        assert!(
+            sets.environments[0].variables[0].secret,
+            "选中的环境 A 被写回"
+        );
+        assert!(
+            !sets.environments[1].variables[0].secret,
+            "激活环境 B 不受影响"
+        );
+    });
+
+    // 改名：中间态 "Alpha " 存为 "Alpha"，但输入框里的尾随空格保留，接着打字不受影响
+    let name_input = cx.read(|app| sheet.read(app).env_name().clone());
+    type_input(cx, &name_input, "Alpha ");
+    cx.run_until_parked();
+    cx.read(|app| {
+        assert_eq!(variables::variables(app).environments[0].name, "Alpha");
+        assert_eq!(name_input.read(app).value().as_ref(), "Alpha ");
+    });
+    type_input(cx, &name_input, "Alpha 2");
+    cx.run_until_parked();
+    cx.read(|app| {
+        let sets = variables::variables(app);
+        assert_eq!(sets.environments[0].name, "Alpha 2");
+        // 改名不动激活状态
+        assert_eq!(sets.active_environment, Some(sets.environments[1].id));
+    });
+    // 激活当前选中的环境
+    cx.update(|_, cx| sheet.update(cx, |s, cx| s.activate_env_for_test(cx)));
+    cx.read(|app| {
+        let sets = variables::variables(app);
+        assert_eq!(sets.active_environment, Some(sets.environments[0].id));
+    });
+
+    // 分类页：定位到给定分类，改动写回该分类
+    cx.update(|window, cx| {
+        sheet.update(cx, |s, cx| {
+            s.load(
+                SheetScope::Group,
+                Some("orphan".into()),
+                vec!["api".into(), "orphan".into()],
+                window,
+                cx,
+            )
+        })
+    });
+    assert_eq!(table_values(cx), vec![("g".to_string(), "1".to_string())]);
+    cx.update(|window, cx| {
+        sheet.update(cx, |s, cx| {
+            s.table().update(cx, |t, cx| {
+                t.set_variables(&[Variable::new("g", "2")], window, cx)
+            });
+            s.commit_table_for_test(cx);
+        })
+    });
+    cx.read(|app| assert_eq!(variables::variables(app).groups["orphan"][0].value, "2"));
+    // 切到另一个分类再清空：不留空条目
+    let group_select = cx.read(|app| sheet.read(app).group_select().clone());
+    pick_select(cx, &group_select, 0);
+    cx.run_until_parked();
+    assert!(table_values(cx).is_empty());
+    cx.update(|window, cx| {
+        sheet.update(cx, |s, cx| {
+            s.table().update(cx, |t, cx| {
+                t.set_variables(&[Variable::new("x", "1")], window, cx)
+            });
+            s.commit_table_for_test(cx);
+            s.table()
+                .update(cx, |t, cx| t.set_variables(&[], window, cx));
+            s.commit_table_for_test(cx);
+        })
+    });
+    cx.read(|app| assert!(!variables::variables(app).groups.contains_key("api")));
+    assert!(store.flush());
+}
+
+/// 分类页的候选 = 已保存请求推导出的分类 ∪ 变量表里挂着变量的分类（成员移走后变量仍可见可删）。
+#[gpui_kit::test]
+fn variables_sheet_group_candidates_include_orphaned_group_vars(cx: &mut TestAppContext) {
+    let (cx, _store, _dir) = init_with_store(cx);
+    cx.update(|_, app| {
+        variables::update(app, |s| {
+            s.groups.insert("api".into(), vec![Variable::new("a", "1")]);
+            s.groups
+                .insert("orphan".into(), vec![Variable::new("o", "1")]);
+        })
+    });
+    let ws = cx.update(|window, cx| cx.new(|cx| Workspace::new(window, cx)));
+    let tab = cx.read(|app| ws.read(app).active_tab());
+    cx.update(|_, cx| {
+        ws.update(cx, |ws, cx| {
+            ws.finish_save(tab.clone(), "r".into(), Some("api".into()), cx)
+        })
+    });
+    let groups = cx.read(|app| ws.read(app).variable_group_names(app));
+    assert_eq!(groups, vec!["api".to_string(), "orphan".to_string()]);
+}
+
+/// 真实 `Root` 窗口里走一遍：图标栏打开抽屉 → 抽屉上弹删除确认 → 整窗画帧 → 确认删除 → 再点图标收起。
+/// Sheet / Dialog 的 builder 都在 `Workspace::render` 内部每帧执行，谁在里面碰宿主，画帧时就会
+/// 二次借用 panic（「点一下就闪退」）。
+#[gpui_kit::test]
+fn variables_sheet_and_delete_dialog_draw_over_the_workspace(cx: &mut TestAppContext) {
+    init_globals(cx);
+    cx.update(|app| {
+        variables::update(app, |s| {
+            let dev = Environment::new("Dev");
+            s.active_environment = Some(dev.id);
+            s.environments = vec![dev, Environment::new("Prod")];
+        })
+    });
+    let slot: Rc<RefCell<Option<Entity<Workspace>>>> = Rc::new(RefCell::new(None));
+    let slot_for_root = slot.clone();
+    let (_, cx) = cx.add_window_view(move |window, cx| {
+        let ws = cx.new(|cx| Workspace::new(window, cx));
+        *slot_for_root.borrow_mut() = Some(ws.clone());
+        Root::new(ws, window, cx)
+    });
+    let ws = slot
+        .borrow_mut()
+        .take()
+        .expect("workspace created inside the root view");
+    let draw = |cx: &mut VisualTestContext| {
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        })
+    };
+
+    cx.update(|window, cx| {
+        ws.update(cx, |ws, cx| {
+            ws.open_tool_section(ToolSection::Variables, window, cx)
+        })
+    });
+    draw(cx);
+    assert!(cx.update(|window, cx| window.has_active_sheet(cx)));
+
+    let sheet = cx.read(|app| ws.read(app).variables_sheet.clone());
+    cx.update(|window, cx| {
+        sheet.update(cx, |s, cx| {
+            s.load(SheetScope::Environment, None, vec![], window, cx);
+            s.confirm_delete_env_for_test(window, cx);
+        })
+    });
+    draw(cx);
+    cx.update(|window, cx| {
+        assert!(window.has_active_dialog(cx));
+        assert!(
+            window.has_active_sheet(cx),
+            "确认框叠在抽屉上，不该把抽屉关掉"
+        );
+    });
+    // 与按下确认键同一条路：对话框聚焦时派发 Confirm
+    cx.update(|window, cx| {
+        window.dispatch_action(
+            Box::new(gpui_kit::component::dialog::Confirm { secondary: false }),
+            cx,
+        )
+    });
+    cx.run_until_parked();
+    draw(cx);
+    cx.read(|app| {
+        let sets = variables::variables(app);
+        assert_eq!(sets.environments.len(), 1);
+        assert_eq!(sets.environments[0].name, "Prod");
+        assert_eq!(sets.active_environment, None, "删掉的是激活环境");
+    });
+    // 抽屉退到剩下的环境
+    let (name, _) = cx.read(|app| sheet.read(app).export_text(app)).unwrap();
+    assert_eq!(name, "Prod.postman_environment.json");
+
+    // 再点一次同一个图标：收起
+    cx.update(|window, cx| {
+        ws.update(cx, |ws, cx| {
+            ws.open_tool_section(ToolSection::Variables, window, cx)
+        })
+    });
+    draw(cx);
+    assert!(!cx.update(|window, cx| window.has_active_sheet(cx)));
+}
+
+/// 抽屉正文与 CodeSheet 同一条约束：自己就是 `Render`，三个作用域页都能单独画出来。
+#[gpui_kit::test]
+fn variables_sheet_renders_every_scope_on_its_own(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    cx.update(|_, app| {
+        variables::update(app, |s| {
+            s.environments.push(Environment::new("Dev"));
+        })
+    });
+    let sheet = cx.update(|window, cx| cx.new(|cx| VariablesSheet::new(window, cx)));
+    for (scope, groups) in [
+        (SheetScope::Global, vec![]),
+        (SheetScope::Environment, vec![]),
+        (SheetScope::Group, vec![]),
+        (SheetScope::Group, vec!["api".to_string()]),
+    ] {
+        cx.update(|window, cx| sheet.update(cx, |s, cx| s.load(scope, None, groups, window, cx)));
+        cx.draw(point(px(0.), px(0.)), size(px(640.), px(700.)), |_, _| {
+            sheet.clone().into_any_element()
+        });
+    }
+}
+
+/// 断言操作的期望值（原文或已替换）。
+fn assert_expected(op: &PostOp) -> &str {
+    match &op.kind {
+        PostOpKind::Assert { expected, .. } => expected,
+        other => panic!("not an assert op: {other:?}"),
+    }
+}
+
+/// 保存 / 重开都带着操作列表，且存的是原文；重开后发送一次，草稿里仍是原文。
+#[gpui_kit::test]
+fn saved_requests_keep_ops_and_raw_placeholders(cx: &mut TestAppContext) {
+    let (cx, store, _dir) = init_with_store(cx);
+    let ws = cx.update(|window, cx| cx.new(|cx| Workspace::new(window, cx)));
+    let tab = cx.read(|app| ws.read(app).active_tab());
+    change_url(&tab, "https://{{host}}/x", cx);
+    cx.update(|window, cx| {
+        tab.update(cx, |t, cx| {
+            t.post_ops.update(cx, |o, cx| {
+                o.set_post_ops(
+                    &[PostOp {
+                        enabled: true,
+                        kind: PostOpKind::Assert {
+                            subject: ResponseSource::Status,
+                            op: AssertOp::Equals,
+                            expected: "{{code}}".into(),
+                        },
+                    }],
+                    window,
+                    cx,
+                )
+            });
+        })
+    });
+    let id = cx
+        .update(|_, cx| {
+            ws.update(cx, |ws, cx| {
+                ws.finish_save(tab.clone(), "x".into(), None, cx)
+            })
+        })
+        .unwrap();
+    assert!(store.flush());
+    let saved = read_request(&store, id).unwrap();
+    assert_eq!(saved.draft.url, "https://{{host}}/x");
+    assert_eq!(saved.draft.post_ops.len(), 1);
+    assert_eq!(assert_expected(&saved.draft.post_ops[0]), "{{code}}");
+    // 重开：操作跟着回来
+    cx.update(|window, cx| {
+        ws.update(cx, |ws, cx| {
+            ws.close_tab(0, window, cx);
+            ws.open_saved(id, window, cx);
+        })
+    });
+    let reopened = cx.read(|app| ws.read(app).active_tab());
+    cx.read(|app| {
+        let t = reopened.read(app);
+        let post_ops = t.post_ops.read(app).post_ops(app);
+        assert_eq!(post_ops.len(), 1);
+        assert_eq!(assert_expected(&post_ops[0]), "{{code}}");
+    });
+
+    // 重开的 Tab 发送一次：host 指向拒绝连接的端口，code 有值
+    let refused = refused_url();
+    let host = refused
+        .trim_start_matches("http://")
+        .trim_end_matches('/')
+        .to_string();
+    cx.update(|_, app| {
+        variables::update(app, |s| {
+            s.globals.push(Variable::new("host", host));
+            s.globals.push(Variable::new("code", "200"));
+        })
+    });
+    cx.update(|window, cx| reopened.update(cx, |t, cx| t.send(window, cx)));
+    wait_until(cx, |cx| {
+        cx.read(|app| !reopened.read(app).response.is_in_flight())
+    });
+    cx.read(|app| {
+        let t = reopened.read(app);
+        // 执行用的是替换后的期望值……
+        match &t.response {
+            ResponseState::Failed {
+                ops: Some(report), ..
+            } => assert_eq!(assert_expected(&report.post.results[0].0), "200"),
+            _ => panic!("expected Failed with ops, got {:?}", t.response.error()),
+        }
+        // ……Tab 里仍是原文
+        assert_eq!(assert_expected(&t.draft(app).post_ops[0]), "{{code}}");
+    });
+    // 草稿文件也是原文
+    cx.update(|_, cx| reopened.update(cx, |t, cx| t.save_draft_now(cx)));
+    assert!(store.flush());
+    let tab_id = cx.read(|app| reopened.read(app).id);
+    assert_eq!(
+        assert_expected(&read_draft(&store, tab_id).unwrap().draft.post_ops[0]),
+        "{{code}}"
+    );
+}
+
+#[gpui_kit::test]
+fn delete_saved_removes_file_and_detaches_tabs(cx: &mut TestAppContext) {
+    let (cx, store, _dir) = init_with_store(cx);
+    let ws = cx.update(|window, cx| cx.new(|cx| Workspace::new(window, cx)));
+    let tab = cx.read(|app| ws.read(app).active_tab());
+    change_url(&tab, "https://api.test/gone", cx);
+    let id = cx
+        .update(|_, cx| {
+            ws.update(cx, |ws, cx| {
+                ws.finish_save(tab.clone(), "待删".into(), None, cx)
+            })
+        })
+        .unwrap();
+    assert!(store.flush());
+    assert_eq!(request_files(&store), 1);
+
+    cx.update(|_, cx| ws.update(cx, |ws, cx| ws.delete_saved(id, cx)));
+    assert!(store.flush());
+    assert_eq!(request_files(&store), 0);
+    cx.read(|app| {
+        assert!(ws.read(app).saved().is_empty());
+        let t = tab.read(app);
+        assert_eq!(t.saved_id, None);
+        assert!(t.saved_name.is_none());
+        assert!(t.dirty, "tab content survives as an unsaved draft");
+        assert_eq!(t.title(app).as_ref(), "/gone");
+    });
+    let tab_id = cx.read(|app| tab.read(app).id);
+    assert_eq!(read_draft(&store, tab_id).unwrap().saved_id, None);
+    // 删除不存在的 id 是 no-op
+    cx.update(|_, cx| ws.update(cx, |ws, cx| ws.delete_saved(Ulid::generate(), cx)));
+}
+
+#[gpui_kit::test]
+fn sidebar_lists_newest_first_and_draws_rows(cx: &mut TestAppContext) {
+    let (cx, _store, _dir) = init_with_store(cx);
+    let ws = cx.update(|window, cx| cx.new(|cx| Workspace::new(window, cx)));
+    let first_tab = cx.read(|app| ws.read(app).active_tab());
+    change_url(&first_tab, "https://api.test/first", cx);
+    let first = cx
+        .update(|_, cx| {
+            ws.update(cx, |ws, cx| {
+                ws.finish_save(first_tab.clone(), "第一".into(), None, cx)
+            })
+        })
+        .unwrap();
+    // 真实时钟前进，保证 updated_at 不同
+    std::thread::sleep(Duration::from_millis(2));
+    cx.update(|window, cx| ws.update(cx, |ws, cx| ws.new_tab(window, cx)));
+    let second_tab = cx.read(|app| ws.read(app).active_tab());
+    change_url(&second_tab, "https://api.test/second", cx);
+    let second = cx
+        .update(|_, cx| {
+            ws.update(cx, |ws, cx| {
+                ws.finish_save(second_tab.clone(), "第二".into(), None, cx)
+            })
+        })
+        .unwrap();
+    cx.read(|app| {
+        let saved = ws.read(app).saved();
+        let ids: Vec<Ulid> = saved.iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec![second, first]);
+    });
+
+    // 真正绘制一帧：侧栏 uniform_list 完成布局，内容高度 = 行高 × 2。
+    // 侧栏默认收成图标栏（不画列表），先展开；
+    // 再 blur：聚焦中的 Input 在渲染时会调用 macOS 的 set_text_content_type，
+    // 而测试窗口没有真实平台窗口句柄（gpui TestWindow::window_handle 是 unimplemented!）。
+    cx.update(|_, cx| ws.update(cx, |ws, cx| ws.toggle_sidebar(cx)));
+    cx.update(|window, cx| window.blur(cx));
+    let ws_element = ws.clone();
+    cx.draw(point(px(0.), px(0.)), size(px(1200.), px(800.)), |_, _| {
+        ws_element.into_any_element()
+    });
+    cx.read(|app| {
+        let laid_out = ws
+            .read(app)
+            .saved_scroll()
+            .0
+            .borrow()
+            .last_item_size
+            .expect("saved list was laid out");
+        assert_eq!(laid_out.contents.height, px(SAVED_ROW_HEIGHT * 2.));
+    });
+}
+
+#[gpui_kit::test]
+fn clear_response_resets_everything_including_the_editor(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let tab = new_tab(cx);
+    install_done(&tab, BodyStore::in_memory(&br#"{"a":1}"#[..]), cx);
+    cx.update(|window, cx| {
+        tab.update(cx, |t, cx| {
+            t.response_section = ResponseSection::Headers;
+            t.notice = Some(Notice::NoResponse);
+            t.unresolved_vars.insert("ghost".to_string());
+            let before = t.generation;
+            assert!(
+                !t.response_editor_for("json")
+                    .read(cx)
+                    .text()
+                    .to_string()
+                    .is_empty()
+            );
+
+            t.clear_response(window, cx);
+
+            assert!(matches!(t.response, ResponseState::Idle));
+            // 编辑器是常驻实体、不随 response 一起 drop，留着旧文本会在 ⌘F 里冒出来
+            assert_eq!(
+                t.response_editor_for("json").read(cx).text().to_string(),
+                ""
+            );
+            assert_eq!(t.response_section, ResponseSection::Body);
+            assert!(t.notice.is_none());
+            // 未定义变量提示描述的是刚清掉的那份响应，一起清空
+            assert!(t.unresolved_vars.is_empty());
+            // generation 必须往前走，否则在途请求的回调还能把旧响应写回来
+            assert_eq!(t.generation, before + 1);
+        })
+    });
+    cx.run_until_parked();
+}
+
+/// 已经是空态时再点一次不该白白递增 generation——那会让一个正常在途的请求
+/// 悄悄失效（此路径下 response 是 Idle，但重发刚起步时也短暂如此）。
+#[gpui_kit::test]
+fn clear_response_on_idle_is_a_no_op(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let tab = new_tab(cx);
+    cx.update(|window, cx| {
+        tab.update(cx, |t, cx| {
+            let before = t.generation;
+            t.clear_response(window, cx);
+            assert_eq!(t.generation, before);
+        })
+    });
+}
+
+#[gpui_kit::test]
+fn find_in_response_focuses_the_editor_on_editor_tier(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let tab = new_tab(cx);
+    install_done(&tab, BodyStore::in_memory(&br#"{"a":1}"#[..]), cx);
+    cx.update(|window, cx| {
+        tab.update(cx, |t, cx| {
+            t.response_section = ResponseSection::Headers;
+            t.find_in_response(window, cx);
+            assert_eq!(t.response_section, ResponseSection::Body);
+            assert!(
+                t.response_editor_for("json")
+                    .read(cx)
+                    .focus_handle(cx)
+                    .is_focused(window),
+                "the read-only editor must take focus so its search panel can open"
+            );
+            assert!(t.notice.is_none());
+        })
+    });
+    cx.run_until_parked();
+}
+
+#[gpui_kit::test]
+fn find_in_response_only_notices_on_virtual_tier(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let tab = new_tab(cx);
+    let text: String = (0..EDITOR_MAX_LINES + 1)
+        .map(|i| format!("line {i}\n"))
+        .collect();
+    let body = BodyStore::in_memory(text.as_bytes().to_vec());
+    let view = ResponseView::prepare(meta("text/plain", body.len()), &body);
+    cx.update(|window, cx| {
+        tab.update(cx, |t, cx| {
+            let g = t.generation;
+            t.apply_outcome(g, Ok((body, view, None)), window, cx);
+            t.find_in_response(window, cx);
+            assert_eq!(t.notice, Some(Notice::VirtualSearch));
+            assert!(
+                !t.response_editor_for("text")
+                    .read(cx)
+                    .focus_handle(cx)
+                    .is_focused(window)
+            );
+        })
+    });
+}
+
+#[gpui_kit::test]
+fn find_in_response_without_a_response_notices(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let tab = new_tab(cx);
+    cx.update(|window, cx| {
+        tab.update(cx, |t, cx| {
+            t.find_in_response(window, cx);
+            assert_eq!(t.notice, Some(Notice::NoResponse));
+        })
+    });
+}
+
+/// 二进制响应连 raw 文档都不准备（`view.doc()` 是 None）：只提示，不抢焦点、不切回 Body。
+#[gpui_kit::test]
+fn find_in_response_on_a_binary_body_notices(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let tab = new_tab(cx);
+    install_done_with(
+        &tab,
+        "image/png",
+        BodyStore::in_memory(&b"\x89PNG\0"[..]),
+        cx,
+    );
+    cx.update(|window, cx| {
+        tab.update(cx, |t, cx| {
+            t.response_section = ResponseSection::Headers;
+            t.find_in_response(window, cx);
+            assert_eq!(t.notice, Some(Notice::BinarySearch));
+            // 提前返回：既不切回 Body，也不把焦点交给（二进制用的）text 编辑器
+            assert_eq!(t.response_section, ResponseSection::Headers);
+            assert!(
+                !t.response_editor_for("text")
+                    .read(cx)
+                    .focus_handle(cx)
+                    .is_focused(window)
+            );
+        })
+    });
+}
+
+/// 空 Body 虽然被判为 A 档，但画的是「响应体为空」占位而非编辑器：只提示，不抢焦点。
+#[gpui_kit::test]
+fn find_in_response_on_an_empty_body_notices(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let tab = new_tab(cx);
+    install_done(&tab, BodyStore::in_memory(&b""[..]), cx);
+    cx.update(|window, cx| {
+        tab.update(cx, |t, cx| {
+            t.find_in_response(window, cx);
+            assert_eq!(t.notice, Some(Notice::EmptyBodySearch));
+            assert!(
+                !t.response_editor_for("json")
+                    .read(cx)
+                    .focus_handle(cx)
+                    .is_focused(window)
+            );
+        })
+    });
+}
+
+/// 两段式按钮直接指定方向，而不是翻转：重复点当前那一段不应有任何变化。
+#[gpui_kit::test]
+fn set_split_is_idempotent_for_the_current_direction(cx: &mut TestAppContext) {
+    let (cx, store, _dir) = init_with_store(cx);
+    let ws = cx.update(|window, cx| cx.new(|cx| Workspace::new(window, cx)));
+    cx.update(|window, cx| {
+        ws.update(cx, |ws, cx| {
+            ws.new_tab(window, cx);
+            assert_eq!(ws.split(), SplitDirection::Horizontal);
+            // 点「右侧」——已经是右侧，保持不变
+            ws.set_split(SplitDirection::Horizontal, cx);
+            assert_eq!(ws.split(), SplitDirection::Horizontal);
+            assert_eq!(ws.tab_at(0).read(cx).split, SplitDirection::Horizontal);
+            // 点「下方」
+            ws.set_split(SplitDirection::Vertical, cx);
+            assert_eq!(ws.split(), SplitDirection::Vertical);
+            ws.set_split(SplitDirection::Vertical, cx);
+            assert_eq!(ws.split(), SplitDirection::Vertical);
+        })
+    });
+    assert!(store.flush());
+    assert_eq!(
+        read_workspace(&store).unwrap().split,
+        SplitDirection::Vertical
+    );
+}
+
+#[gpui_kit::test]
+fn split_direction_applies_to_all_tabs_and_persists(cx: &mut TestAppContext) {
+    let (cx, store, _dir) = init_with_store(cx);
+    let ws = cx.update(|window, cx| cx.new(|cx| Workspace::new(window, cx)));
+    cx.update(|window, cx| {
+        ws.update(cx, |ws, cx| {
+            ws.new_tab(window, cx);
+            // 默认左右分栏：响应区在右侧
+            assert_eq!(ws.split(), SplitDirection::Horizontal);
+            ws.set_split(SplitDirection::Vertical, cx);
+            assert_eq!(ws.split(), SplitDirection::Vertical);
+            assert_eq!(ws.tab_at(0).read(cx).split, SplitDirection::Vertical);
+            assert_eq!(ws.tab_at(1).read(cx).split, SplitDirection::Vertical);
+            // 切换后新建的 Tab 继承方向
+            ws.new_tab(window, cx);
+            assert_eq!(ws.tab_at(2).read(cx).split, SplitDirection::Vertical);
+        })
+    });
+    assert!(store.flush());
+    assert_eq!(
+        read_workspace(&store).unwrap().split,
+        SplitDirection::Vertical
+    );
+    cx.update(|_, cx| ws.update(cx, |ws, cx| ws.set_split(SplitDirection::Horizontal, cx)));
+    assert!(store.flush());
+    assert_eq!(
+        read_workspace(&store).unwrap().split,
+        SplitDirection::Horizontal
+    );
+    cx.read(|app| {
+        assert_eq!(
+            ws.read(app).tab_at(2).read(app).split,
+            SplitDirection::Horizontal
+        )
+    });
+}
+
+#[gpui_kit::test]
+fn workspace_draws_with_title_bar(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let ws = cx.update(|window, cx| cx.new(|cx| Workspace::new(window, cx)));
+    let tab = cx.read(|app| ws.read(app).active_tab());
+    change_url(&tab, "https://api.test/users/1", cx);
+    cx.read(|app| assert_eq!(ws.read(app).title_bar_subtitle(app).as_ref(), "/users/1"));
+    // 整个 Workspace（含 TitleBar）在 TestPlatform 下能画出一帧：TitleBar 会查询 window_decorations /
+    // is_fullscreen / window_controls，这些在测试窗口上都有实现或默认值。
+    // 先 blur：聚焦中的 Input 渲染时会去拿真实平台窗口句柄（TestWindow 未实现），与
+    // sidebar_lists_newest_first_and_draws_rows 同样的原因。
+    cx.update(|window, cx| window.blur(cx));
+    let ws_element = ws.clone();
+    cx.draw(point(px(0.), px(0.)), size(px(1200.), px(800.)), |_, _| {
+        ws_element.into_any_element()
+    });
+    // 新建的空 Tab 成为激活 Tab：副标题跟着变（测试进程的 locale 是 en）
+    let _locale = crate::i18n::locale_test_lock();
+    cx.update(|window, cx| ws.update(cx, |ws, cx| ws.new_tab(window, cx)));
+    cx.read(|app| assert_eq!(ws.read(app).title_bar_subtitle(app).as_ref(), "New request"));
+}
+
+/// 标签栏上每个标签都带 method 角标；多开几个把它画出来，确认 prefix 与
+/// dirty 圆点合并后仍能布局（prefix 只能设一次，合并写错会丢圆点或 panic）。
+#[gpui_kit::test]
+fn tab_bar_with_method_badges_draws(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let ws = cx.update(|window, cx| cx.new(|cx| Workspace::new(window, cx)));
+    cx.update(|window, cx| {
+        ws.update(cx, |ws, cx| {
+            // 六个标签：够触发溢出滚动与箭头按钮
+            for _ in 0..5 {
+                ws.new_tab(window, cx);
+            }
+            assert_eq!(ws.tab_count(), 6);
+        })
+    });
+    // 其中一个标记为有改动：圆点要和角标并排，而不是互相覆盖
+    let dirty_tab = cx.read(|app| ws.read(app).tab_at(2));
+    cx.update(|_, cx| dirty_tab.update(cx, |t, cx| t.mark_dirty(cx)));
+
+    cx.update(|window, cx| window.blur(cx));
+    let element = ws.clone();
+    cx.draw(point(px(0.), px(0.)), size(px(1200.), px(800.)), |_, _| {
+        element.into_any_element()
+    });
+}
+
+/// URL 栏：发送按钮在前、保存拆成「保存 + ∨」两半，输入框里还嵌了版本选择器。
+/// 这些都是新加的元素，先确认整行能画出来。
+#[gpui_kit::test]
+fn url_bar_with_split_save_and_version_picker_draws(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let tab = new_tab(cx);
+    change_url(&tab, "https://api.test/users/1", cx);
+    // 非默认版本：标签从「自动」换成协议名，宽度也跟着变
+    cx.update(|_, cx| {
+        tab.update(cx, |t, cx| {
+            t.http_version = HttpVersionPref::Http2;
+            cx.notify();
+        })
+    });
+
+    cx.update(|window, cx| window.blur(cx));
+    let element = tab.clone();
+    cx.draw(point(px(0.), px(0.)), size(px(1200.), px(800.)), |_, _| {
+        element.into_any_element()
+    });
+}
+
+/// URL 栏未解析变量提示能正常渲染。
+#[gpui_kit::test]
+fn url_bar_unresolved_vars_warning_draws(cx: &mut TestAppContext) {
+    let (tab, cx) = tab_in_root_window(cx);
+    // 设置两个未解析变量
+    cx.update(|_, cx| {
+        tab.update(cx, |t, cx| {
+            t.unresolved_vars.insert("var_a".to_string());
+            t.unresolved_vars.insert("var_b".to_string());
+            cx.notify();
+        })
+    });
+
+    // 绘制一帧，确保不 panic
+    cx.draw(point(px(0.), px(0.)), size(px(1200.), px(800.)), |_, _| {
+        tab.clone().into_any_element()
+    });
+}
+
+/// 证书页签只在拿到证书时出现，且体检有结论时上方挂横幅。
+#[gpui_kit::test]
+fn certificate_tab_appears_only_with_a_certificate(cx: &mut TestAppContext) {
+    // 纯函数部分：http 请求不该多出一页
+    assert_eq!(
+        ResponseSection::visible(false, false),
+        vec![ResponseSection::Body, ResponseSection::Headers]
+    );
+    assert_eq!(
+        ResponseSection::visible(true, false),
+        vec![
+            ResponseSection::Body,
+            ResponseSection::Headers,
+            ResponseSection::Certificate
+        ]
+    );
+
+    let cx = init(cx);
+    let tab = new_tab(cx);
+    let body = BodyStore::in_memory(&b"{}"[..]);
+    let mut m = meta("application/json", body.len());
+    m.http_version = Some("HTTP/2".into());
+    m.certificate = Some(Box::new(cert_info(vec![CertWarning::SelfSigned])));
+    let view = ResponseView::prepare(m, &body);
+    cx.update(|window, cx| {
+        tab.update(cx, |t, cx| {
+            t.generation += 1;
+            let g = t.generation;
+            t.apply_outcome(g, Ok((body, view, None)), window, cx);
+            // 切到证书页：横幅 + 字段表都要能画
+            t.response_section = ResponseSection::Certificate;
+            cx.notify();
+        })
+    });
+
+    cx.update(|window, cx| window.blur(cx));
+    let element = tab.clone();
+    cx.draw(point(px(0.), px(0.)), size(px(1200.), px(800.)), |_, _| {
+        element.into_any_element()
+    });
+}
+
+/// 上一条响应有证书、下一条没有：页签消失后停在 Certificate 上不能画白板。
+#[gpui_kit::test]
+fn certificate_section_falls_back_to_body_without_a_certificate(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let tab = new_tab(cx);
+    let body = BodyStore::in_memory(&b"{\"a\":1}"[..]);
+    install_done(&tab, body, cx); // meta() 里 certificate 为 None
+    cx.update(|_, cx| {
+        tab.update(cx, |t, cx| {
+            t.response_section = ResponseSection::Certificate;
+            cx.notify();
+        })
+    });
+
+    cx.update(|window, cx| window.blur(cx));
+    let element = tab.clone();
+    cx.draw(point(px(0.), px(0.)), size(px(1200.), px(800.)), |_, _| {
+        element.into_any_element()
+    });
+}
+
+/// 请求面板「操作」页签：两张操作表各带几行也要能画出来（此前从未被任何测试渲染过）。
+#[gpui_kit::test]
+fn request_pane_ops_tab_draws_with_rows(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let tab = new_tab(cx);
+    cx.update(|window, cx| {
+        tab.update(cx, |t, cx| {
+            t.request_section = RequestSection::Ops;
+            t.pre_ops.update(cx, |o, cx| {
+                o.set_pre_ops(
+                    &[
+                        pre_set(VarScope::Global, "who", "cat"),
+                        pre_set(VarScope::Environment, "req", "{{$timestamp}}"),
+                    ],
+                    window,
+                    cx,
+                )
+            });
+            t.post_ops.update(cx, |o, cx| {
+                o.set_post_ops(
+                    &[
+                        extract_status("code"),
+                        PostOp {
+                            enabled: true,
+                            kind: PostOpKind::Assert {
+                                subject: ResponseSource::Status,
+                                op: AssertOp::Equals,
+                                expected: "200".into(),
+                            },
+                        },
+                    ],
+                    window,
+                    cx,
+                )
+            });
+            cx.notify();
+        })
+    });
+
+    cx.update(|window, cx| window.blur(cx));
+    let element = tab.clone();
+    cx.draw(point(px(0.), px(0.)), size(px(1200.), px(800.)), |_, _| {
+        element.into_any_element()
+    });
+    cx.read(|app| {
+        let t = tab.read(app);
+        assert_eq!(t.request_section, RequestSection::Ops);
+        assert_eq!(t.pre_ops.read(app).count(app), 2);
+        assert_eq!(t.post_ops.read(app).count(app), 2);
+    });
+}
+
+/// 响应面板「操作」页签、Done 分支：一条通过的提取（目标已标敏感，触发掩码分支）、
+/// 一条失败的断言（`op_detail` + `mask_secrets` 分支）、一条因没有激活环境被跳过的
+/// 前置行，三种行样式一起画出来。
+#[gpui_kit::test]
+fn response_pane_ops_tab_draws_done_report_with_masked_and_failed_rows(cx: &mut TestAppContext) {
+    let (cx, _store, _dir) = init_with_store(cx);
+    // 提前把 "token" 标成敏感值：后置提取写回时按 key 命中旧行，secret 标记保留
+    // （`VariableSets::set_var` 的约定，见 core::model 测试）。
+    cx.update(|_, app| {
+        variables::update(app, |s| {
+            s.globals.push(Variable {
+                secret: true,
+                ..Variable::new("token", "")
+            })
+        })
+    });
+    let (base, _rx) = echo_server(r#"{"data":{"token":"T"}}"#);
+    let tab = new_tab(cx);
+    cx.update(|window, cx| {
+        tab.update(cx, |t, cx| {
+            t.pre_ops.update(cx, |o, cx| {
+                // 没有激活环境：这条前置行执行后落成跳过
+                o.set_pre_ops(&[pre_set(VarScope::Environment, "req", "x")], window, cx)
+            });
+            t.post_ops.update(cx, |o, cx| {
+                o.set_post_ops(
+                    &[
+                        PostOp {
+                            enabled: true,
+                            kind: PostOpKind::Extract {
+                                scope: VarScope::Global,
+                                key: "token".into(),
+                                source: ResponseSource::JsonPath {
+                                    path: "$.data.token".into(),
+                                },
+                            },
+                        },
+                        PostOp {
+                            enabled: true,
+                            kind: PostOpKind::Assert {
+                                subject: ResponseSource::Status,
+                                op: AssertOp::Equals,
+                                expected: "201".into(),
+                            },
+                        },
+                    ],
+                    window,
+                    cx,
+                )
+            });
+        })
+    });
+    set_url_and_send(&tab, &base, cx);
+    wait_until(cx, |cx| {
+        cx.read(|app| !tab.read(app).response.is_in_flight())
+    });
+    cx.update(|_, cx| {
+        tab.update(cx, |t, cx| {
+            t.response_section = ResponseSection::Ops;
+            cx.notify();
+        })
+    });
+
+    cx.update(|window, cx| window.blur(cx));
+    let element = tab.clone();
+    cx.draw(point(px(0.), px(0.)), size(px(1200.), px(800.)), |_, _| {
+        element.into_any_element()
+    });
+    cx.read(|app| {
+        let t = tab.read(app);
+        let ResponseState::Done {
+            ops: Some(report), ..
+        } = &t.response
+        else {
+            panic!(
+                "expected Done with ops report, got {:?}",
+                t.response.error()
+            );
+        };
+        assert_eq!(
+            report.pre[0].1,
+            OpOutcome::Skipped(OpSkip::NoActiveEnvironment)
+        );
+        assert_eq!(report.post.results[0].1, OpOutcome::Passed);
+        assert!(matches!(
+            report.post.results[1].1,
+            OpOutcome::Failed(OpFailure::Mismatch { .. })
+        ));
+    });
+}
+
+/// 响应面板「操作」页签、Failed 分支（非取消）：前置结果保留、后置操作全落成
+/// 「请求失败，未执行」，这条渲染路径此前没有测试画过。
+#[gpui_kit::test]
+fn response_pane_ops_tab_draws_failed_report(cx: &mut TestAppContext) {
+    let (cx, _store, _dir) = init_with_store(cx);
+    let tab = new_tab(cx);
+    cx.update(|window, cx| {
+        tab.update(cx, |t, cx| {
+            t.pre_ops.update(cx, |o, cx| {
+                o.set_pre_ops(&[pre_set(VarScope::Global, "who", "cat")], window, cx)
+            });
+            t.post_ops.update(cx, |o, cx| {
+                o.set_post_ops(&[extract_status("leak")], window, cx)
+            });
+        })
+    });
+    set_url_and_send(&tab, &refused_url(), cx);
+    wait_until(cx, |cx| {
+        cx.read(|app| !tab.read(app).response.is_in_flight())
+    });
+    cx.update(|_, cx| {
+        tab.update(cx, |t, cx| {
+            t.response_section = ResponseSection::Ops;
+            cx.notify();
+        })
+    });
+
+    cx.update(|window, cx| window.blur(cx));
+    let element = tab.clone();
+    cx.draw(point(px(0.), px(0.)), size(px(1200.), px(800.)), |_, _| {
+        element.into_any_element()
+    });
+    cx.read(|app| {
+        let t = tab.read(app);
+        assert!(
+            matches!(t.response, ResponseState::Failed { ops: Some(_), .. }),
+            "{:?}",
+            t.response.error()
+        );
+    });
+}
+
+/// 变量表：`secret_capable` 打开时锁按钮与掩码值输入框两条分支（敏感行 + 普通行）
+/// 一起画出来，此前只有不画帧的读断言测试覆盖过这张表。
+#[gpui_kit::test]
+fn kv_table_secret_capable_draws_masked_and_plain_rows(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let table = cx.update(|window, cx| {
+        cx.new(|cx| KvTable::new(KvPlaceholder::Variable, window, cx).secret_capable(true))
+    });
+    let vars = vec![
+        Variable::new("host", "h"),
+        Variable {
+            secret: true,
+            ..Variable::new("token", "t")
+        },
+    ];
+    cx.update(|window, cx| table.update(cx, |t, cx| t.set_variables(&vars, window, cx)));
+
+    cx.update(|window, cx| window.blur(cx));
+    let element = table.clone();
+    cx.draw(point(px(0.), px(0.)), size(px(900.), px(600.)), |_, _| {
+        element.into_any_element()
+    });
+    cx.read(|app| {
+        let t = table.read(app);
+        assert!(!t.row_secret(0));
+        assert!(t.row_secret(1));
+    });
+}
+
+fn temp_form_file(name: &str, bytes: &[u8]) -> PathBuf {
+    let path = std::env::temp_dir().join(format!("germal-form-{}-{name}", std::process::id()));
+    std::fs::write(&path, bytes).unwrap();
+    path
+}
+
+#[gpui_kit::test]
+fn kv_table_form_fields_roundtrip_and_refresh_size(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let file = temp_form_file("doc.json", b"{}");
+    let table = cx.update(|window, cx| {
+        cx.new(|cx| KvTable::new(KvPlaceholder::Field, window, cx).file_capable(true))
+    });
+    let fields = vec![
+        FormField {
+            description: "备注".into(),
+            ..FormField::text("note", "hi")
+        },
+        FormField {
+            value: FormValue::File {
+                path: file.clone(),
+                content_type: Some("text/csv".into()),
+            },
+            ..FormField::file("doc", PathBuf::new())
+        },
+        FormField {
+            enabled: false,
+            ..FormField::text("off", "")
+        },
+        // 文件行未选文件：也是一行有效数据（draft 会据此报"未选择文件"）
+        FormField::file("avatar", PathBuf::new()),
+    ];
+    cx.update(|window, cx| {
+        table.update(cx, |t, cx| {
+            t.set_form_fields(&fields, window, cx);
+            assert_eq!(t.form_fields(cx), fields);
+            assert_eq!(t.row_count(), 5);
+        })
+    });
+    cx.run_until_parked();
+    cx.read(|app| assert_eq!(table.read(app).row_file_size(1), Some(2)));
+    let _ = std::fs::remove_file(&file);
+}
+
+/// 变量表：secret 行掩码显示、往返保留 secret 标记。
+#[gpui_kit::test]
+fn kv_table_variables_round_trip_with_secret(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let table = cx.update(|window, cx| {
+        cx.new(|cx| KvTable::new(KvPlaceholder::Variable, window, cx).secret_capable(true))
+    });
+    let vars = vec![
+        Variable::new("host", "h"),
+        Variable {
+            secret: true,
+            ..Variable::new("token", "t")
+        },
+    ];
+    cx.update(|window, cx| table.update(cx, |t, cx| t.set_variables(&vars, window, cx)));
+    cx.read(|app| {
+        let t = table.read(app);
+        assert_eq!(t.variables(app), vars);
+        assert!(!t.row_secret(0));
+        assert!(t.row_secret(1));
+        assert!(t.row_value_masked(1, app));
+        // 没有 `$` 开头的 key：不提示
+        assert!(!t.has_builtin_name_hint(app));
+    });
+    cx.update(|window, cx| table.update(cx, |t, cx| t.set_row_secret(0, true, window, cx)));
+    cx.read(|app| {
+        let t = table.read(app);
+        assert!(t.variables(app)[0].secret);
+        assert!(t.row_value_masked(0, app));
+    });
+}
+
+/// 变量表：key 以 `$` 开头（内置动态变量命名空间）会触发提示；普通表（非 secret_capable）不提示。
+#[gpui_kit::test]
+fn kv_table_dynamic_name_clash_triggers_builtin_hint(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let table = cx.update(|window, cx| {
+        cx.new(|cx| KvTable::new(KvPlaceholder::Variable, window, cx).secret_capable(true))
+    });
+    cx.update(|window, cx| {
+        table.update(cx, |t, cx| {
+            t.set_variables(&[Variable::new("$timestamp", "")], window, cx)
+        })
+    });
+    cx.read(|app| assert!(table.read(app).has_builtin_name_hint(app)));
+
+    // 非变量表（未开 secret_capable）即便凑巧撞上 `$` 前缀也不提示：这条提示只对变量表有意义
+    let plain = cx.update(|window, cx| cx.new(|cx| KvTable::new(KvPlaceholder::Param, window, cx)));
+    cx.update(|window, cx| {
+        plain.update(cx, |t, cx| {
+            t.set_values(&[KeyValue::new("$timestamp", "")], window, cx)
+        })
+    });
+    cx.read(|app| assert!(!plain.read(app).has_builtin_name_hint(app)));
+}
+
+#[gpui_kit::test]
+fn ops_table_round_trips_pre_and_post_ops(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let pre = cx.update(|window, cx| cx.new(|cx| OpsTable::new(OpsMode::Pre, window, cx)));
+    let post = cx.update(|window, cx| cx.new(|cx| OpsTable::new(OpsMode::Post, window, cx)));
+    let pre_ops = vec![PreOp {
+        enabled: false,
+        kind: PreOpKind::SetVariable {
+            scope: VarScope::Environment,
+            key: "ts".into(),
+            value: "{{$timestamp}}".into(),
+        },
+    }];
+    let post_ops = vec![
+        PostOp {
+            enabled: true,
+            kind: PostOpKind::Extract {
+                scope: VarScope::Global,
+                key: "tok".into(),
+                source: ResponseSource::JsonPath { path: "$.t".into() },
+            },
+        },
+        PostOp {
+            enabled: true,
+            kind: PostOpKind::Assert {
+                subject: ResponseSource::Status,
+                op: AssertOp::Equals,
+                expected: "200".into(),
+            },
+        },
+    ];
+    cx.update(|window, cx| {
+        pre.update(cx, |t, cx| t.set_pre_ops(&pre_ops, window, cx));
+        post.update(cx, |t, cx| t.set_post_ops(&post_ops, window, cx));
+    });
+    cx.read(|app| {
+        assert_eq!(pre.read(app).pre_ops(app), pre_ops);
+        assert_eq!(post.read(app).post_ops(app), post_ops);
+        // 末尾各有一个空行，不进结果
+        assert_eq!(pre.read(app).row_count(), 2);
+        assert_eq!(post.read(app).row_count(), 3);
+    });
+}
+
+/// 删掉前面的行之后，下拉的订阅必须按实体找行而不是按创建时的行号：
+/// 否则后面的行整体上移，改第 0 行的下拉会落到原来的第 2 行上。
+#[gpui_kit::test]
+fn ops_table_select_changes_after_removing_a_row_land_on_the_right_row(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let table = cx.update(|window, cx| cx.new(|cx| OpsTable::new(OpsMode::Post, window, cx)));
+    let extract = |source: ResponseSource, key: &str| PostOp {
+        enabled: true,
+        kind: PostOpKind::Extract {
+            scope: VarScope::Global,
+            key: key.into(),
+            source,
+        },
+    };
+    let ops = vec![
+        extract(ResponseSource::JsonPath { path: "$.a".into() }, "k1"),
+        extract(ResponseSource::Header { name: "b".into() }, "k2"),
+        PostOp {
+            enabled: true,
+            kind: PostOpKind::Assert {
+                subject: ResponseSource::JsonPath { path: "$.c".into() },
+                op: AssertOp::Equals,
+                expected: "v".into(),
+            },
+        },
+    ];
+    cx.update(|window, cx| table.update(cx, |t, cx| t.set_post_ops(&ops, window, cx)));
+    cx.update(|window, cx| table.update(cx, |t, cx| t.remove_row(0, window, cx)));
+    cx.read(|app| assert_eq!(table.read(app).post_ops(app), ops[1..].to_vec()));
+
+    // 第 0 行（原第 1 行）作用域 → 当前环境
+    let scope_select = cx.read(|app| table.read(app).row_scope_select(0));
+    pick_select(cx, &scope_select, VarScope::Environment.index());
+    let row0_extract = PostOp {
+        enabled: true,
+        kind: PostOpKind::Extract {
+            scope: VarScope::Environment,
+            key: "k2".into(),
+            source: ResponseSource::Header { name: "b".into() },
+        },
+    };
+    cx.read(|app| {
+        assert_eq!(
+            table.read(app).post_ops(app),
+            vec![row0_extract.clone(), ops[2].clone()]
+        )
+    });
+
+    // 第 1 行（原第 2 行）算子 → 包含
+    let op_select = cx.read(|app| table.read(app).row_op_select(1));
+    pick_select(cx, &op_select, AssertOp::Contains.index());
+    let row1_contains = PostOp {
+        enabled: true,
+        kind: PostOpKind::Assert {
+            subject: ResponseSource::JsonPath { path: "$.c".into() },
+            op: AssertOp::Contains,
+            expected: "v".into(),
+        },
+    };
+    cx.read(|app| {
+        assert_eq!(
+            table.read(app).post_ops(app),
+            vec![row0_extract.clone(), row1_contains.clone()]
+        )
+    });
+
+    // 第 0 行类型 → 断言响应头：参数 A / B 原样沿用，第 1 行不受影响
+    let kind_select = cx.read(|app| table.read(app).row_kind_select(0));
+    pick_select(cx, &kind_select, PostRowKind::AssertHeader.index());
+    cx.read(|app| {
+        assert_eq!(
+            table.read(app).post_ops(app),
+            vec![
+                PostOp {
+                    enabled: true,
+                    kind: PostOpKind::Assert {
+                        subject: ResponseSource::Header { name: "b".into() },
+                        op: AssertOp::Equals,
+                        expected: "k2".into(),
+                    },
+                },
+                row1_contains,
+            ]
+        );
+        assert_eq!(table.read(app).row_count(), 3);
+    });
+}
+
+/// 与用户在下拉里选中一项走同一条路：改选中项并发出 Confirm，由表格的订阅处理。
+fn pick_select(
+    cx: &mut VisualTestContext,
+    sel: &Entity<SelectState<Vec<SharedString>>>,
+    ix: usize,
+) {
+    cx.update(|window, cx| {
+        sel.update(cx, |s, cx| {
+            s.set_selected_index(Some(IndexPath::new(ix)), window, cx);
+            let value = s.selected_value().cloned();
+            cx.emit(SelectEvent::Confirm(value));
+        })
+    });
+}
+
+/// 与用户打字走同一条路：`set_value` 本身不发事件，改完值再补发 Change，由表格的订阅处理。
+fn type_input(cx: &mut VisualTestContext, input: &Entity<InputState>, text: &str) {
+    let text = text.to_string();
+    cx.update(|window, cx| {
+        input.update(cx, |s, cx| {
+            s.set_value(text, window, cx);
+            cx.emit(InputEvent::Change);
+        })
+    });
+}
+
+/// 被禁用的输入框（Status 类型的参数 A）文字保留，但不参与判空与生成操作；切回来文字还在。
+#[gpui_kit::test]
+fn ops_table_disabled_source_input_keeps_text_but_produces_no_op(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let table = cx.update(|window, cx| cx.new(|cx| OpsTable::new(OpsMode::Post, window, cx)));
+    let a = cx.read(|app| table.read(app).row_a_input(0));
+    type_input(cx, &a, "$.data.token");
+    cx.read(|app| {
+        assert_eq!(table.read(app).post_ops(app).len(), 1);
+        assert_eq!(table.read(app).row_count(), 2);
+    });
+
+    // 切到「断言状态码」：参数 A 禁用，这一行没有任何生效的输入 → 不产出操作
+    let kind_select = cx.read(|app| table.read(app).row_kind_select(0));
+    pick_select(cx, &kind_select, PostRowKind::AssertStatus.index());
+    cx.read(|app| {
+        assert!(table.read(app).post_ops(app).is_empty());
+        assert_eq!(a.read(app).value().as_ref(), "$.data.token");
+    });
+
+    // 切回「提取 JSON 路径」并填变量名：路径原样恢复，操作重新出现
+    pick_select(cx, &kind_select, PostRowKind::ExtractJson.index());
+    let b = cx.read(|app| table.read(app).row_b_input(0));
+    type_input(cx, &b, "tok");
+    cx.read(|app| {
+        assert_eq!(
+            table.read(app).post_ops(app),
+            vec![PostOp {
+                enabled: true,
+                kind: PostOpKind::Extract {
+                    scope: VarScope::Global,
+                    key: "tok".into(),
+                    source: ResponseSource::JsonPath {
+                        path: "$.data.token".into()
+                    },
+                },
+            }]
+        )
+    });
+}
+
+/// 算子切到 Exists 后期望值输入框禁用：残留文字不进 `expected`，切回来又生效。
+#[gpui_kit::test]
+fn ops_table_exists_ignores_leftover_expected_value(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let table = cx.update(|window, cx| cx.new(|cx| OpsTable::new(OpsMode::Post, window, cx)));
+    let assert_with = |op: AssertOp, expected: &str| PostOp {
+        enabled: true,
+        kind: PostOpKind::Assert {
+            subject: ResponseSource::JsonPath {
+                path: "$.ok".into(),
+            },
+            op,
+            expected: expected.into(),
+        },
+    };
+    cx.update(|window, cx| {
+        table.update(cx, |t, cx| {
+            t.set_post_ops(&[assert_with(AssertOp::Equals, "true")], window, cx)
+        })
+    });
+
+    let op_select = cx.read(|app| table.read(app).row_op_select(0));
+    pick_select(cx, &op_select, AssertOp::Exists.index());
+    cx.read(|app| {
+        assert_eq!(
+            table.read(app).post_ops(app),
+            vec![assert_with(AssertOp::Exists, "")]
+        );
+        let b = table.read(app).row_b_input(0);
+        assert_eq!(b.read(app).value().as_ref(), "true");
+    });
+
+    pick_select(cx, &op_select, AssertOp::Equals.index());
+    cx.read(|app| {
+        assert_eq!(
+            table.read(app).post_ops(app),
+            vec![assert_with(AssertOp::Equals, "true")]
+        )
+    });
+}
+
+/// 空行上挑下拉 / 删空行不影响 `post_ops()`，不该发 `Changed`（任务 3 会拿它置脏）；非空行上改下拉要发。
+#[gpui_kit::test]
+fn ops_table_only_emits_changed_when_ops_can_change(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let table = cx.update(|window, cx| cx.new(|cx| OpsTable::new(OpsMode::Post, window, cx)));
+    let changed = Rc::new(Cell::new(0));
+    let _sub = cx.update(|_, cx| {
+        let changed = changed.clone();
+        cx.subscribe(&table, move |_, _: &OpsTableEvent, _| {
+            changed.set(changed.get() + 1)
+        })
+    });
+
+    // 末尾空行（第 0 行）上改三个下拉、再删掉它：都不发
+    let (kind_select, scope_select, op_select) = cx.read(|app| {
+        let t = table.read(app);
+        (
+            t.row_kind_select(0),
+            t.row_scope_select(0),
+            t.row_op_select(0),
+        )
+    });
+    pick_select(cx, &scope_select, VarScope::Environment.index());
+    pick_select(cx, &kind_select, PostRowKind::AssertHeader.index());
+    pick_select(cx, &op_select, AssertOp::Contains.index());
+    cx.update(|window, cx| table.update(cx, |t, cx| t.remove_row(0, window, cx)));
+    assert_eq!(changed.get(), 0);
+    cx.read(|app| {
+        assert!(table.read(app).post_ops(app).is_empty());
+        assert_eq!(table.read(app).row_count(), 1);
+    });
+
+    // 程序化载入一条非空行：不发
+    let op = PostOp {
+        enabled: true,
+        kind: PostOpKind::Extract {
+            scope: VarScope::Global,
+            key: "k".into(),
+            source: ResponseSource::Header { name: "h".into() },
+        },
+    };
+    cx.update(|window, cx| table.update(cx, |t, cx| t.set_post_ops(&[op], window, cx)));
+    assert_eq!(changed.get(), 0);
+
+    // 非空行（第 0 行）改作用域：发一次
+    let scope_select = cx.read(|app| table.read(app).row_scope_select(0));
+    pick_select(cx, &scope_select, VarScope::Group.index());
+    assert_eq!(changed.get(), 1);
+
+    // 新的末尾空行（第 1 行）改类型：不发
+    let kind_select = cx.read(|app| table.read(app).row_kind_select(1));
+    pick_select(cx, &kind_select, PostRowKind::AssertJson.index());
+    assert_eq!(changed.get(), 1);
+}
+
+#[gpui_kit::test]
+fn kv_table_choose_row_file_sets_path_and_switching_back_drops_it(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let file = temp_form_file("pic.png", b"png!");
+    let table = cx.update(|window, cx| {
+        cx.new(|cx| KvTable::new(KvPlaceholder::Field, window, cx).file_capable(true))
+    });
+    cx.update(|window, cx| {
+        table.update(cx, |t, cx| {
+            t.set_form_fields(&[FormField::text("avatar", "")], window, cx);
+            t.set_row_kind(0, RowKind::File, cx);
+            t.choose_row_file(0, window, cx);
+        })
+    });
+    assert!(cx.did_prompt_for_paths());
+    let chosen = file.clone();
+    cx.simulate_path_prompt_response(move |opts| {
+        assert!(opts.files && !opts.directories && !opts.multiple);
+        Some(vec![chosen])
+    });
+    cx.run_until_parked();
+    cx.read(|app| {
+        let t = table.read(app);
+        assert_eq!(
+            t.form_fields(app)[0].value,
+            FormValue::File {
+                path: file.clone(),
+                content_type: None
+            }
+        );
+        assert_eq!(t.row_file_size(0), Some(4));
+    });
+    // 切回 Text：丢弃路径，值为空文本
+    cx.update(|_, cx| table.update(cx, |t, cx| t.set_row_kind(0, RowKind::Text, cx)));
+    cx.read(|app| {
+        let f = &table.read(app).form_fields(app)[0];
+        assert_eq!(f.key, "avatar");
+        assert_eq!(
+            f.value,
+            FormValue::Text {
+                value: String::new()
+            }
+        );
+    });
+    let _ = std::fs::remove_file(&file);
+}
+
+#[gpui_kit::test]
+fn kv_table_cancelled_row_file_dialog_keeps_row(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let table = cx.update(|window, cx| {
+        cx.new(|cx| KvTable::new(KvPlaceholder::Field, window, cx).file_capable(true))
+    });
+    cx.update(|window, cx| {
+        table.update(cx, |t, cx| {
+            t.set_form_fields(&[FormField::file("doc", PathBuf::new())], window, cx);
+            t.choose_row_file(0, window, cx);
+        })
+    });
+    cx.simulate_path_prompt_response(|_| None);
+    cx.run_until_parked();
+    cx.read(|app| {
+        assert_eq!(
+            table.read(app).form_fields(app),
+            vec![FormField::file("doc", PathBuf::new())]
+        );
+    });
+}
+
+/// 在末尾空行上选文件：该行变成有内容的一行，末尾必须再补一个空行，否则用户没法继续加字段。
+#[gpui_kit::test]
+fn kv_table_choosing_file_on_trailing_row_appends_empty_row(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let file = temp_form_file("trailing.txt", b"hello");
+    let table = cx.update(|window, cx| {
+        cx.new(|cx| KvTable::new(KvPlaceholder::Field, window, cx).file_capable(true))
+    });
+    cx.update(|window, cx| {
+        table.update(cx, |t, cx| {
+            t.set_form_fields(&[], window, cx);
+            assert_eq!(t.row_count(), 1);
+            t.set_row_kind(0, RowKind::File, cx);
+            t.choose_row_file(0, window, cx);
+        })
+    });
+    let chosen = file.clone();
+    cx.simulate_path_prompt_response(move |_| Some(vec![chosen]));
+    cx.run_until_parked();
+    cx.read(|app| {
+        let t = table.read(app);
+        assert_eq!(t.row_count(), 2);
+        assert_eq!(t.row_file_size(0), Some(5));
+        assert_eq!(t.form_fields(app), vec![FormField::file("", file.clone())]);
+    });
+    let _ = std::fs::remove_file(&file);
+}
+
+#[gpui_kit::test]
+fn rail_click_expands_then_collapses_the_same_section(cx: &mut TestAppContext) {
+    let (cx, store, _dir) = init_with_store(cx);
+    let ws = cx.update(|window, cx| cx.new(|cx| Workspace::new(window, cx)));
+    cx.read(|app| assert!(ws.read(app).sidebar_collapsed()));
+
+    // 收起状态下点功能图标：展开并切到它
+    cx.update(|_, cx| {
+        ws.update(cx, |ws, cx| {
+            ws.open_sidebar_section(SidebarSection::Saved, cx)
+        })
+    });
+    cx.read(|app| {
+        let ws = ws.read(app);
+        assert!(!ws.sidebar_collapsed());
+        assert_eq!(ws.sidebar_section(), SidebarSection::Saved);
+    });
+    // 再点同一个：收起
+    cx.update(|_, cx| {
+        ws.update(cx, |ws, cx| {
+            ws.open_sidebar_section(SidebarSection::Saved, cx)
+        })
+    });
+    cx.read(|app| assert!(ws.read(app).sidebar_collapsed()));
+    // 折叠状态落盘
+    assert!(store.flush());
+    assert!(read_workspace(&store).unwrap().sidebar_collapsed);
+}
+
+#[gpui_kit::test]
+fn settings_update_persists_and_applies_font_size(cx: &mut TestAppContext) {
+    // settings::install / update 会触碰进程级的 locale
+    let _locale = crate::i18n::locale_test_lock();
+    let (cx, store, _dir) = init_with_store(cx);
+    cx.update(|_, cx| settings::install(cx, None));
+    cx.read(|app| assert_eq!(settings::settings(app), AppSettings::default()));
+
+    cx.update(|_, cx| {
+        settings::update(cx, |s| {
+            s.editor_font_size = 16;
+            s.request.follow_redirects = false;
+        })
+    });
+    cx.read(|app| {
+        let s = settings::settings(app);
+        assert_eq!(s.editor_font_size, 16);
+        assert!(!s.request.follow_redirects);
+        assert_eq!(app.theme().mono_font_size, px(16.));
+    });
+    assert!(store.flush());
+    let on_disk = read_settings(&store).expect("settings.json written");
+    assert_eq!(on_disk.editor_font_size, 16);
+    assert!(!on_disk.request.follow_redirects);
+
+    // 字号越界被夹回范围；没有实际变化的 update 不写文件
+    let writes = store.write_count();
+    cx.update(|_, cx| settings::update(cx, |s| s.editor_font_size = 99));
+    cx.read(|app| assert_eq!(settings::settings(app).editor_font_size, 24));
+    cx.update(|_, cx| settings::update(cx, |_| {}));
+    assert!(store.flush());
+    assert_eq!(store.write_count(), writes + 1);
+
+    cx.update(|_, cx| settings::reset(cx));
+    cx.read(|app| assert_eq!(settings::settings(app), AppSettings::default()));
+}
+
+/// 更新源跟随设置即时切换：自动模式随界面语言变，显式选择压过语言；全程不重建 Updater 实体。
+/// 末尾切回英文：locale 是进程级全局，不能把别的测试留在中文里。
+#[gpui_kit::test]
+fn update_source_follows_settings_and_language(cx: &mut TestAppContext) {
+    use crate::state::update::ResolvedSource;
+    use germal_core::model::UpdateSourcePref;
+
+    let _locale = crate::i18n::locale_test_lock();
+    let cx = init(cx);
+    cx.update(|_, cx| {
+        settings::install(cx, None);
+        update::install(cx);
+    });
+    let updater_before = cx.read(|app| update::updater(app).expect("平台有产物，更新器已安装"));
+    // 测试环境的系统语言列表为空 → 界面语言英文 → 自动模式落在全球源
+    cx.read(|app| assert_eq!(update::resolved_source(app), Some(ResolvedSource::Global)));
+
+    // 界面切中文：自动模式跟着换到大陆镜像
+    cx.update(|_, cx| settings::update(cx, |s| s.language = LanguagePref::Chinese));
+    cx.read(|app| {
+        assert_eq!(
+            update::resolved_source(app),
+            Some(ResolvedSource::ChinaMirror)
+        )
+    });
+
+    // 显式选全球源：语言仍是中文，但显式选择压过自动
+    cx.update(|_, cx| settings::update(cx, |s| s.update_source = UpdateSourcePref::Global));
+    cx.read(|app| assert_eq!(update::resolved_source(app), Some(ResolvedSource::Global)));
+
+    // 显式选大陆镜像后切回英文界面：显式选择不受语言影响
+    cx.update(|_, cx| settings::update(cx, |s| s.update_source = UpdateSourcePref::ChinaMirror));
+    cx.update(|_, cx| settings::update(cx, |s| s.language = LanguagePref::English));
+    cx.read(|app| {
+        assert_eq!(
+            update::resolved_source(app),
+            Some(ResolvedSource::ChinaMirror)
+        );
+        // Updater 实体没被重建，Workspace 的订阅不会失联
+        assert_eq!(
+            update::updater(app).expect("更新器仍在").entity_id(),
+            updater_before.entity_id()
+        );
+    });
+}
+
+/// 设置里切换语言：rust-i18n 的 locale、`Locale` 全局与驻留在 InputState 里的占位符都立即更新，
+/// 不需要重启。末尾切回英文：locale 是进程级全局，不能把别的测试留在中文里。
+#[gpui_kit::test]
+fn switching_language_updates_placeholders_immediately(cx: &mut TestAppContext) {
+    let _locale = crate::i18n::locale_test_lock();
+    let cx = init(cx);
+    cx.update(|_, cx| settings::install(cx, None));
+    let tab = new_tab(cx);
+    cx.read(|app| {
+        assert_eq!(app.global::<Locale>().0, "en");
+        assert_eq!(
+            tab.read(app)
+                .url
+                .read(app)
+                .presentation()
+                .placeholder()
+                .as_ref(),
+            "Enter a request URL, e.g. https://api.example.com/users/{id}"
+        );
+        assert_eq!(
+            tab.read(app)
+                .params
+                .read(app)
+                .key_placeholder(0, app)
+                .as_ref(),
+            "Name"
+        );
+    });
+
+    cx.update(|_, cx| settings::update(cx, |s| s.language = LanguagePref::Chinese));
+    cx.run_until_parked();
+    cx.read(|app| {
+        assert_eq!(app.global::<Locale>().0, "zh-CN");
+        assert_eq!(settings::settings(app).language, LanguagePref::Chinese);
+        assert_eq!(
+            tab.read(app)
+                .url
+                .read(app)
+                .presentation()
+                .placeholder()
+                .as_ref(),
+            "输入请求 URL，例如 https://api.example.com/users/{id}"
+        );
+        assert_eq!(
+            tab.read(app)
+                .params
+                .read(app)
+                .key_placeholder(0, app)
+                .as_ref(),
+            "参数名"
+        );
+        assert_eq!(
+            tab.read(app)
+                .headers
+                .read(app)
+                .key_placeholder(0, app)
+                .as_ref(),
+            "Header 名"
+        );
+    });
+
+    // 第三门语言走同一条链路：中文 → 日文也要立即生效，不能只在英文 ↔ 中文之间切得动
+    cx.update(|_, cx| settings::update(cx, |s| s.language = LanguagePref::Japanese));
+    cx.run_until_parked();
+    cx.read(|app| {
+        assert_eq!(app.global::<Locale>().0, "ja");
+        assert_eq!(&*rust_i18n::locale(), "ja");
+        assert_eq!(settings::settings(app).language, LanguagePref::Japanese);
+        assert_eq!(
+            tab.read(app)
+                .url
+                .read(app)
+                .presentation()
+                .placeholder()
+                .as_ref(),
+            "リクエスト URL を入力（例：https://api.example.com/users/{id}）"
+        );
+        assert_eq!(
+            tab.read(app)
+                .params
+                .read(app)
+                .key_placeholder(0, app)
+                .as_ref(),
+            "名前"
+        );
+        assert_eq!(
+            crate::ui::text::language_label(LanguagePref::Japanese).as_ref(),
+            "日本語"
+        );
+    });
+
+    cx.update(|_, cx| settings::update(cx, |s| s.language = LanguagePref::English));
+    cx.run_until_parked();
+    cx.read(|app| {
+        assert_eq!(app.global::<Locale>().0, "en");
+        assert_eq!(
+            tab.read(app)
+                .params
+                .read(app)
+                .key_placeholder(0, app)
+                .as_ref(),
+            "Name"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn settings_dropdown_theme_change_needs_no_window(cx: &mut TestAppContext) {
+    let (cx, store, _dir) = init_with_store(cx);
+    let ws = cx.update(|window, cx| cx.new(|cx| Workspace::new(window, cx)));
+    cx.update(|_, cx| ws.update(cx, |ws, cx| ws.set_theme_global(ThemePref::Dark, cx)));
+    cx.read(|app| {
+        assert_eq!(ws.read(app).theme(), ThemePref::Dark);
+        assert!(app.theme().mode.is_dark());
+    });
+    assert!(store.flush());
+    assert_eq!(read_workspace(&store).unwrap().theme, ThemePref::Dark);
+}
+
+/// ⌘, 的按键串必须能被 gpui 解析，否则 `bind_keys` 会在启动时 panic。
+#[test]
+fn settings_shortcut_keystroke_parses() {
+    for ks in ["cmd-,", "ctrl-,"] {
+        assert!(gpui_kit::Keystroke::parse(ks).is_ok(), "{ks}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 应用内更新：用假源驱动 gpui-updater，不碰网络
+// ---------------------------------------------------------------------------
+
+/// 返回固定结果的 `UpdateSource`；闭包每次调用构造新值（`Error` 不是 Clone）。
+struct FakeSource(Box<dyn Fn() -> gpui_updater::Result<gpui_updater::Release> + Send + Sync>);
+
+impl gpui_updater::UpdateSource for FakeSource {
+    fn fetch_latest(&self) -> gpui_updater::Result<gpui_updater::Release> {
+        (self.0)()
+    }
+}
+
+/// 带签名与校验和声明的 release：`Verification::Strict` 在检查阶段只验"有没有"，不访问网络。
+fn fake_release(version: gpui_updater::Version) -> gpui_updater::Release {
+    gpui_updater::Release {
+        version,
+        notes: None,
+        asset: gpui_updater::Asset {
+            name: "Germal-macos-arm64.dmg".into(),
+            url: "https://example.invalid/Germal-macos-arm64.dmg".into(),
+            size: 0,
+        },
+        signature: Some("untrusted comment: test\nRUSTtest".into()),
+        signature_url: None,
+        sha256: Some("00".repeat(32)),
+    }
+}
+
+fn install_fake_updater(
+    cx: &mut VisualTestContext,
+    kind: InstallKind,
+    fetch: impl Fn() -> gpui_updater::Result<gpui_updater::Release> + Send + Sync + 'static,
+) {
+    cx.update(|_, cx| {
+        update::install_with_source(
+            cx,
+            FakeSource(Box::new(fetch)),
+            update::engine_config(),
+            kind,
+        )
+    });
+}
+
+fn v(major: u64) -> gpui_updater::Version {
+    gpui_updater::Version::new(major, 0, 0)
+}
+
+#[gpui_kit::test]
+async fn update_check_surfaces_new_version_in_workspace(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    install_fake_updater(cx, InstallKind::Installed, || Ok(fake_release(v(99))));
+    let ws = cx.update(|window, cx| cx.new(|cx| Workspace::new(window, cx)));
+    assert_eq!(
+        cx.update(|_, cx| ws.read(cx).update_status().clone()),
+        gpui_updater::UpdateStatus::Idle
+    );
+
+    cx.update(|_, cx| update::check(cx));
+    cx.run_until_parked();
+
+    assert_eq!(
+        cx.update(|_, cx| update::status(cx)),
+        gpui_updater::UpdateStatus::Available(v(99))
+    );
+    // Workspace 通过 observe 同步到了同一状态
+    let status = cx.update(|_, cx| ws.read(cx).update_status().clone());
+    assert_eq!(update::hint_version(&status), Some((&v(99), false)));
+    assert!(cx.update(|_, cx| update::can_install(cx)));
+
+    // 状态栏带提示时能画出一帧
+    // 聚焦中的 URL 输入框在测试窗口里渲染会碰真实平台句柄（见 sidebar 测试的说明），先 blur
+    cx.update(|window, cx| window.blur(cx));
+    let ws_element = ws.clone();
+    cx.draw(point(px(0.), px(0.)), size(px(1000.), px(800.)), |_, _| {
+        ws_element.into_any_element()
+    });
+}
+
+#[gpui_kit::test]
+async fn update_check_up_to_date_has_no_hint(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    install_fake_updater(cx, InstallKind::Installed, || Ok(fake_release(v(0))));
+    let ws = cx.update(|window, cx| cx.new(|cx| Workspace::new(window, cx)));
+
+    cx.update(|_, cx| update::check(cx));
+    cx.run_until_parked();
+
+    assert_eq!(
+        cx.update(|_, cx| update::status(cx)),
+        gpui_updater::UpdateStatus::UpToDate
+    );
+    let status = cx.update(|_, cx| ws.read(cx).update_status().clone());
+    assert_eq!(update::hint_version(&status), None);
+    assert!(!cx.update(|_, cx| update::can_install(cx)));
+}
+
+#[gpui_kit::test]
+async fn update_check_error_is_surfaced(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    install_fake_updater(cx, InstallKind::Installed, || {
+        Err(gpui_updater::Error::Http("offline".into()))
+    });
+    let ws = cx.update(|window, cx| cx.new(|cx| Workspace::new(window, cx)));
+
+    cx.update(|_, cx| update::check(cx));
+    cx.run_until_parked();
+
+    let status = cx.update(|_, cx| update::status(cx));
+    assert!(
+        matches!(&status, gpui_updater::UpdateStatus::Errored(msg) if msg.contains("offline")),
+        "{status:?}"
+    );
+    assert_eq!(update::hint_version(&status), None);
+    assert_eq!(
+        cx.update(|_, cx| ws.read(cx).update_status().clone()),
+        status
+    );
+    // 离线启动不能把状态栏搞坏
+    cx.update(|window, cx| window.blur(cx));
+    let ws_element = ws.clone();
+    cx.draw(point(px(0.), px(0.)), size(px(1000.), px(800.)), |_, _| {
+        ws_element.into_any_element()
+    });
+}
+
+#[gpui_kit::test]
+async fn launch_check_respects_setting(cx: &mut TestAppContext) {
+    let _locale = crate::i18n::locale_test_lock();
+    let cx = init(cx);
+    install_fake_updater(cx, InstallKind::Installed, || Ok(fake_release(v(99))));
+    cx.update(|_, cx| {
+        settings::install(
+            cx,
+            Some(AppSettings {
+                check_updates_on_launch: false,
+                ..Default::default()
+            }),
+        )
+    });
+
+    cx.update(|_, cx| update::schedule_launch_check(cx));
+    cx.executor()
+        .advance_clock(update::LAUNCH_CHECK_DELAY + Duration::from_secs(1));
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, cx| update::status(cx)),
+        gpui_updater::UpdateStatus::Idle,
+        "关闭开关后启动不应检查"
+    );
+
+    cx.update(|_, cx| settings::update(cx, |s| s.check_updates_on_launch = true));
+    cx.update(|_, cx| update::schedule_launch_check(cx));
+    // 延迟未到：仍未开始
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, cx| update::status(cx)),
+        gpui_updater::UpdateStatus::Idle
+    );
+    cx.executor()
+        .advance_clock(update::LAUNCH_CHECK_DELAY + Duration::from_secs(1));
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, cx| update::status(cx)),
+        gpui_updater::UpdateStatus::Available(v(99))
+    );
+}
+
+#[gpui_kit::test]
+async fn dev_builds_can_check_but_not_install(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    install_fake_updater(cx, InstallKind::DevBuild, || Ok(fake_release(v(99))));
+
+    cx.update(|_, cx| update::check(cx));
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, cx| update::status(cx)),
+        gpui_updater::UpdateStatus::Available(v(99))
+    );
+    assert!(!cx.update(|_, cx| update::can_install(cx)));
+
+    cx.update(|_, cx| update::download_and_install(cx));
+    cx.run_until_parked();
+    // 没有进入 Downloading / Errored：开发构建直接拒绝安装
+    assert_eq!(
+        cx.update(|_, cx| update::status(cx)),
+        gpui_updater::UpdateStatus::Available(v(99))
+    );
+}
+
+#[gpui_kit::test]
+async fn unsupported_platform_has_no_updater(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    assert!(!cx.update(|_, cx| update::supported(cx)));
+    assert_eq!(
+        cx.update(|_, cx| update::status(cx)),
+        gpui_updater::UpdateStatus::Idle
+    );
+    // 没有更新器时这些动作都是空操作，不能 panic
+    cx.update(|_, cx| {
+        update::check(cx);
+        update::download_and_install(cx);
+        update::schedule_launch_check(cx);
+    });
+    cx.run_until_parked();
+    let ws = cx.update(|window, cx| cx.new(|cx| Workspace::new(window, cx)));
+    assert_eq!(
+        cx.update(|_, cx| ws.read(cx).update_status().clone()),
+        gpui_updater::UpdateStatus::Idle
+    );
+}
+
+/// 侧栏展开后不该自己变窄。
+///
+/// 回归 gpui-component 的这条坑：`ResizablePanel` 在 `visible(false)` 时 render 直接
+/// `return div()`，既不 prepaint 也不写 `ResizableState::sizes`，于是侧栏收起期间 sizes
+/// 停在陈旧的 `[侧栏宽, 容器全宽]`，总和远大于容器；此后只要容器尺寸一变
+/// （启动后更新检查回来改状态栏、窗口 resize 都算），`ResizablePanelGroup` 就按
+/// `size / total` 的比例重分配，把侧栏压窄——用户看到的就是「展开几秒后自己缩了一点」。
+///
+/// 三帧分别对应：收起态记下「主工作区占满全宽」、展开、容器变窄触发重分配。
+#[gpui_kit::test]
+fn sidebar_keeps_its_width_when_the_container_resizes(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let ws = cx.update(|window, cx| cx.new(|cx| Workspace::new(window, cx)));
+    // 聚焦中的 Input 渲染时会调 macOS 的 set_text_content_type，测试窗口没有真实句柄
+    cx.update(|window, cx| window.blur(cx));
+
+    let draw = |cx: &mut VisualTestContext, width: f32| {
+        let element = ws.clone();
+        cx.draw(point(px(0.), px(0.)), size(px(width), px(800.)), |_, _| {
+            element.into_any_element()
+        });
+    };
+
+    // 默认收起：这一帧让 ResizableState 记下「主工作区独占全宽」
+    draw(cx, 1200.);
+    cx.update(|_, cx| ws.update(cx, |ws, cx| ws.toggle_sidebar(cx)));
+    draw(cx, 1200.);
+    // 容器宽度一变就会触发 adjust_to_container_size —— 漂移原本发生在这里
+    draw(cx, 1100.);
+
+    cx.read(|app| {
+        let ws = ws.read(app);
+        assert!(!ws.sidebar_collapsed(), "侧栏应当是展开的");
+        let sizes = ws.sidebar_panel_sizes(app);
+        assert_eq!(sizes.len(), 2, "工作区就两个 panel：侧栏与主区");
+        assert!(
+            (sizes[0] - SIDEBAR_DEFAULT_WIDTH).abs() < 1.0,
+            "侧栏被重分配压成了 {} px，应当保持 {SIDEBAR_DEFAULT_WIDTH} px",
+            sizes[0]
+        );
+    });
+}
+
+/// 回归「点开侧栏后过几秒自己变窄」的真正路径——上面那条测的是
+/// `adjust_to_container_size` 的比例重分配（状态层），这条测的是 flex 收缩（样式层），
+/// 两者独立：`ResizableState::sizes` 全程不动，缩的是渲染出来的宽度。
+///
+/// 机制：启动后 `sizes` 里是占位的 `PANEL_MIN_SIZE`；首次展开的那一帧 prepaint 把
+/// 占位值覆写成 `Some(实测宽)`。而 `ResizablePanel` 只在 size 为 `None` 时才给自己
+/// `flex_none`——一旦是 `Some`，面板就带着 `flex_grow:1 + 默认 flex_shrink:1` 参与
+/// 布局，主区（flex_basis = 容器全宽）在下一次 Workspace 重新 render 时把它压掉
+/// 约 60 px。「过几秒」= 等到下一个触发重绘的事件（启动后的更新检查回调、任意点击）。
+#[gpui_kit::test]
+fn sidebar_holds_rendered_width_after_first_expand(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let ws = cx.update(|window, cx| cx.new(|cx| Workspace::new(window, cx)));
+    // 聚焦中的 Input 渲染时会调 macOS 的 set_text_content_type，测试窗口没有真实句柄
+    cx.update(|window, cx| window.blur(cx));
+
+    let draw = |cx: &mut VisualTestContext| {
+        let element = ws.clone();
+        cx.draw(point(px(0.), px(0.)), size(px(1200.), px(800.)), |_, _| {
+            element.into_any_element()
+        });
+    };
+
+    // 默认收起：这一帧主区被量成容器全宽，侧栏的 sizes 槽位停在占位值
+    draw(cx);
+    cx.update(|_, cx| ws.update(cx, |ws, cx| ws.toggle_sidebar(cx)));
+    // 展开后的第一帧：panel size 还是 None（flex_none 生效），量出精确宽度，
+    // 但 prepaint 把占位值覆写成了 Some
+    draw(cx);
+    let expanded = cx
+        .debug_bounds("sidebar-panel")
+        .expect("展开后侧栏应当画了出来")
+        .size
+        .width;
+    assert_eq!(expanded, px(SIDEBAR_DEFAULT_WIDTH), "展开当帧就不该被压窄");
+
+    // 模拟任意一次触发 Workspace 重绘的事件（现实里是启动几秒后更新检查回来）
+    cx.update(|_, cx| ws.update(cx, |_, cx| cx.notify()));
+    draw(cx);
+    let after = cx
+        .debug_bounds("sidebar-panel")
+        .expect("重绘后侧栏应当还在")
+        .size
+        .width;
+    assert_eq!(after, expanded, "重绘后侧栏不该自己变窄");
+}
+
+/// 「启动即展开」的姊妹洞：第一帧两个 panel 的占位值**都**会被覆写成 `Some`，
+/// 「任一 panel 为 None 就不做比例重分配」的保护随之失效——此后窗口宽度一变，
+/// `adjust_to_container_size` 就按 size/total 把侧栏一起缩放，而不是只伸缩主区。
+#[gpui_kit::test]
+fn sidebar_holds_width_when_restored_expanded_and_window_resizes(cx: &mut TestAppContext) {
+    let (cx, store, _dir) = init_with_store(cx);
+    store.write_workspace(WorkspaceState {
+        sidebar_collapsed: false,
+        sidebar_width: Some(SIDEBAR_DEFAULT_WIDTH),
+        ..Default::default()
+    });
+    assert!(store.flush());
+    let loaded = store.load_all();
+    let ws = cx.update(|window, cx| cx.new(|cx| Workspace::restore(loaded, window, cx)));
+    cx.update(|window, cx| window.blur(cx));
+
+    let draw = |cx: &mut VisualTestContext, width: f32| {
+        let element = ws.clone();
+        cx.draw(point(px(0.), px(0.)), size(px(width), px(800.)), |_, _| {
+            element.into_any_element()
+        });
+    };
+
+    draw(cx, 1200.);
+    // 容器宽度一变就触发 adjust_to_container_size
+    draw(cx, 1000.);
+    cx.update(|_, cx| ws.update(cx, |_, cx| cx.notify()));
+    draw(cx, 1000.);
+    let after = cx
+        .debug_bounds("sidebar-panel")
+        .expect("侧栏应当画了出来")
+        .size
+        .width;
+    assert_eq!(
+        after,
+        px(SIDEBAR_DEFAULT_WIDTH),
+        "窗口变窄后侧栏应保持固定宽度，只伸缩主区"
+    );
+}
+
+/// 换行是**全局**偏好而不是每个 Tab 各管各的：在一个 Tab 上按下开关，其余 Tab 的
+/// 编辑器下一帧就得跟上。同步走的是 `render` 里比对缓存——`set_soft_wrap` 需要
+/// `Window`，而 `settings::update` 只拿得到 `App`，没法在改设置的当场推给所有 Tab。
+#[gpui_kit::test]
+fn wrap_preference_is_global_and_reaches_every_tab(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let first = new_tab(cx);
+    let second = new_tab(cx);
+
+    // 默认：请求体换行（自己写的 JSON，横向找行尾更烦），响应体不换行（保持行对齐好扫）
+    cx.read(|app| {
+        assert_eq!(first.read(app).applied_wrap(), (true, false));
+        assert_eq!(second.read(app).applied_wrap(), (true, false));
+    });
+
+    cx.update(|_, cx| first.update(cx, |t, cx| t.toggle_request_wrap(cx)));
+    cx.read(|app| assert!(!settings::settings(app).wrap_request_body));
+
+    draw_tab(&first, cx);
+    draw_tab(&second, cx);
+    cx.read(|app| {
+        assert_eq!(first.read(app).applied_wrap(), (false, false));
+        assert_eq!(
+            second.read(app).applied_wrap(),
+            (false, false),
+            "另一个 Tab 的编辑器也要跟上全局偏好"
+        );
+    });
+}
+
+/// 响应体换行只在 A 档（只读 Editor）可用；没有响应、或大响应走按行虚拟化时都不可用。
+/// `uniform_list` 要求所有行等高，换行会直接打破这个前提。
+#[gpui_kit::test]
+fn response_wrap_is_unavailable_without_an_editor_tier_body(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let tab = new_tab(cx);
+    cx.read(|app| {
+        assert!(
+            !tab.read(app).response_wrap_available(),
+            "还没有响应时没什么可换行的"
+        );
+    });
+}
+
+/// 标签右键菜单的三个动作。都不弹二次确认——草稿本来就随时落盘，
+/// 「关闭即删草稿」是 `close_tab` 早就定下的语义。
+#[gpui_kit::test]
+fn tab_menu_actions_duplicate_and_close(cx: &mut TestAppContext) {
+    let (cx, store, _dir) = init_with_store(cx);
+    let ws = cx.update(|window, cx| cx.new(|cx| Workspace::new(window, cx)));
+    cx.update(|window, cx| {
+        ws.update(cx, |ws, cx| {
+            for _ in 0..3 {
+                ws.new_tab(window, cx);
+            }
+        })
+    });
+    cx.read(|app| assert_eq!(ws.read(app).tab_count(), 4));
+
+    // 复制指定下标（而不是当前）：副本插在源右侧并成为当前
+    cx.update(|window, cx| ws.update(cx, |ws, cx| ws.duplicate_tab(0, window, cx)));
+    cx.read(|app| {
+        assert_eq!(ws.read(app).tab_count(), 5);
+        assert_eq!(ws.read(app).active_index(), 1, "副本插在源 Tab 右侧并激活");
+    });
+
+    // 关闭其他：留下的必须是指定的那一个，不能因为删除时下标前移而删错
+    let keep_id = cx.read(|app| ws.read(app).tab_at(2).read(app).id);
+    cx.update(|_, cx| ws.update(cx, |ws, cx| ws.close_other_tabs(2, cx)));
+    cx.read(|app| {
+        let ws = ws.read(app);
+        assert_eq!(ws.tab_count(), 1);
+        assert_eq!(
+            ws.tab_at(0).read(app).id,
+            keep_id,
+            "留下的应当是第 2 个 Tab"
+        );
+        assert_eq!(ws.active_index(), 0);
+    });
+
+    // 关闭所有：工作区不留空窗，补一个全新的空 Tab
+    let before = cx.read(|app| ws.read(app).tab_at(0).read(app).id);
+    cx.update(|window, cx| ws.update(cx, |ws, cx| ws.close_all_tabs(window, cx)));
+    cx.read(|app| {
+        let ws = ws.read(app);
+        assert_eq!(ws.tab_count(), 1, "关光之后要补一个新 Tab");
+        assert_ne!(ws.tab_at(0).read(app).id, before, "补的是全新的 Tab");
+    });
+
+    // 关掉的 Tab 的草稿文件都得删干净，否则重启会诈尸
+    assert!(store.flush());
+    let loaded = store.load_all();
+    assert_eq!(loaded.drafts.len(), 1, "只该剩下最后那个新 Tab 的草稿");
+}
+
+/// 多行模式：三行为一页，左右按钮翻页，切换行数会写进 workspace.json。
+#[gpui_kit::test]
+fn tab_rows_toggle_pages_through_tabs_and_persists(cx: &mut TestAppContext) {
+    let (cx, store, _dir) = init_with_store(cx);
+    let ws = cx.update(|window, cx| cx.new(|cx| Workspace::new(window, cx)));
+    cx.update(|window, cx| {
+        ws.update(cx, |ws, cx| {
+            for _ in 0..15 {
+                ws.new_tab(window, cx);
+            }
+        })
+    });
+    cx.update(|window, cx| window.blur(cx));
+
+    cx.read(|app| assert_eq!(ws.read(app).tab_rows(), 1, "默认单行"));
+    cx.update(|_, cx| ws.update(cx, |ws, cx| ws.toggle_tab_rows(cx)));
+    cx.read(|app| assert_eq!(ws.read(app).tab_rows(), MAX_TAB_ROWS));
+
+    // 画一帧，标签区才量得到可用宽度（900 px 减去新建按钮与环境切换器等控件后还剩多少，
+    // 不摆死成常量——控件多一个 / 宽一点都不该让这条测试跟着改数字）
+    let ws_element = ws.clone();
+    cx.draw(point(px(0.), px(0.)), size(px(900.), px(600.)), |_, _| {
+        ws_element.into_any_element()
+    });
+    cx.read(|app| {
+        let width = ws.read(app).strip_width();
+        assert!(width > 0., "画过一帧后应当量到宽度");
+        assert!(
+            tabs_per_page(width, MAX_TAB_ROWS) < 16,
+            "16 个标签在 900 px 下装不进一页，否则这条测不到翻页"
+        );
+    });
+
+    // 翻到下一页，再翻回来；两端都不该越界。`toggle_tab_rows` 那一下是在布局量出来
+    // 之前调的 `reveal_active_tab`（`strip_width` 还是 0），算出来的页码本来就偏大，
+    // 所以这一步的期望值不是「+1」，而是「撞到量出真实宽度后的末页就停住」。
+    cx.update(|_, cx| ws.update(cx, |ws, cx| ws.step_tabs(1, cx)));
+    cx.read(|app| {
+        let ws = ws.read(app);
+        let pages = page_count(
+            ws.tab_count(),
+            tabs_per_page(ws.strip_width(), MAX_TAB_ROWS),
+        );
+        assert_eq!(ws.tab_page(), pages - 1, "翻到底就停住，不越界");
+    });
+    cx.update(|_, cx| {
+        ws.update(cx, |ws, cx| {
+            for _ in 0..10 {
+                ws.step_tabs(1, cx);
+            }
+        })
+    });
+    cx.read(|app| {
+        let ws = ws.read(app);
+        let pages = page_count(
+            ws.tab_count(),
+            tabs_per_page(ws.strip_width(), MAX_TAB_ROWS),
+        );
+        assert_eq!(ws.tab_page(), pages - 1, "翻到底就停住，不越界");
+    });
+    cx.update(|_, cx| {
+        ws.update(cx, |ws, cx| {
+            for _ in 0..10 {
+                ws.step_tabs(-1, cx);
+            }
+        })
+    });
+    cx.read(|app| assert_eq!(ws.read(app).tab_page(), 0, "翻回第一页就停住"));
+
+    // 激活一个在后面几页的标签，视图要跟着翻过去。
+    // 先切到第一个：最后新建的 Tab 本来就是当前项，直接 activate 它是空操作。
+    cx.update(|_, cx| ws.update(cx, |ws, cx| ws.activate(0, cx)));
+    cx.read(|app| assert_eq!(ws.read(app).tab_page(), 0));
+    cx.update(|_, cx| ws.update(cx, |ws, cx| ws.activate(15, cx)));
+    cx.read(|app| {
+        let ws = ws.read(app);
+        let per_page = tabs_per_page(ws.strip_width(), MAX_TAB_ROWS);
+        assert_eq!(ws.tab_page(), 15 / per_page, "激活的标签必须在当前页里");
+    });
+
+    assert!(store.flush());
+    let state = read_workspace(&store).expect("workspace.json written");
+    assert_eq!(state.tab_rows, MAX_TAB_ROWS, "行数偏好要落盘");
+}
+/// 写 `count` 份草稿加一份 workspace.json，第 `active` 个为激活项；返回按顺序排好的 id。
+///
+/// URL 特意写长：单行模式下标签宽度是「内容撑开、上限 `TAB_WIDTH`」，短标题会让 16 个标签
+/// 挤得下一屏，这条测试也就测不到滚动了。
+fn write_tabs_with_active(store: &Store, count: usize, active: usize, tab_rows: u8) -> Vec<Ulid> {
+    let ids: Vec<Ulid> = (0..count).map(|_| Ulid::generate()).collect();
+    for (i, id) in ids.iter().enumerate() {
+        store.write_draft(TabDraft {
+            id: *id,
+            draft: RequestDraft {
+                url: format!("https://api.test/a/rather/long/path/segment/{i}"),
+                ..Default::default()
+            },
+            saved_id: None,
+            dirty: false,
+        });
+    }
+    store.write_workspace(WorkspaceState {
+        tab_order: ids.clone(),
+        active: Some(ids[active]),
+        sidebar_width: None,
+        sidebar_collapsed: true,
+        theme: ThemePref::System,
+        split: SplitDirection::default(),
+        tab_rows,
+    });
+    assert!(store.flush());
+    ids
+}
+
+/// 走 `frames` 帧真实帧序：每帧**先**跑 `on_next_frame` 回调**再**画。
+///
+/// 顺序必须与 gpui 的帧循环一致（回调在 `window.draw` 之前，zed e0931d5
+/// `crates/gpui/src/window.rs:1592`）——`restore` 发生在首帧之前，只有照这个顺序泵帧，
+/// 才复现得出「第一层回调触发时还什么都没画」这个前提。
+fn pump_frames(ws: &Entity<Workspace>, frames: usize, cx: &mut VisualTestContext) {
+    for _ in 0..frames {
+        cx.update(|window, cx| window.simulate_next_frame(cx));
+        let element = ws.clone();
+        cx.draw(point(px(0.), px(0.)), size(px(900.), px(600.)), |_, _| {
+            element.into_any_element()
+        });
+    }
+}
+
+/// 重启后激活的标签在靠后的一页：多行模式下画完首帧必须自动翻到它所在那页。
+#[gpui_kit::test]
+fn restore_reveals_active_tab_page_in_multi_row(cx: &mut TestAppContext) {
+    let (cx, store, _dir) = init_with_store(cx);
+    const ACTIVE: usize = 13;
+    write_tabs_with_active(&store, 16, ACTIVE, MAX_TAB_ROWS);
+
+    let loaded = store.load_all();
+    assert!(loaded.errors.is_empty(), "{:?}", loaded.errors);
+    let ws = cx.update(|window, cx| cx.new(|cx| Workspace::restore(loaded, window, cx)));
+    cx.update(|window, cx| window.blur(cx));
+
+    // 三帧才够：第一帧出布局，第二帧滚动箭头出现（标签区随之变窄），第三帧偏移才算得准。
+    // 多泵一帧留点余量，免得断言钉死在准确的帧数上。
+    pump_frames(&ws, 4, cx);
+
+    cx.read(|app| {
+        let ws = ws.read(app);
+        assert_eq!(ws.active_index(), ACTIVE, "激活项应当来自 workspace.json");
+        let per_page = tabs_per_page(ws.strip_width(), MAX_TAB_ROWS);
+        let want = ACTIVE / per_page;
+        assert!(
+            want > 0,
+            "激活标签得落在第一页之外这条测试才有意义（per_page = {per_page}）"
+        );
+        assert_eq!(ws.tab_page(), want, "重启后要翻到激活标签所在那页");
+    });
+}
+
+/// 同一件事的单行版：重启后横向滚动条要把激活的标签滚进视口。
+#[gpui_kit::test]
+fn restore_scrolls_active_tab_into_view_in_single_row(cx: &mut TestAppContext) {
+    let (cx, store, _dir) = init_with_store(cx);
+    const ACTIVE: usize = 13;
+    write_tabs_with_active(&store, 16, ACTIVE, 1);
+
+    let loaded = store.load_all();
+    assert!(loaded.errors.is_empty(), "{:?}", loaded.errors);
+    let ws = cx.update(|window, cx| cx.new(|cx| Workspace::restore(loaded, window, cx)));
+    cx.update(|window, cx| window.blur(cx));
+
+    // 三帧才够：第一帧出布局，第二帧滚动箭头出现（标签区随之变窄），第三帧偏移才算得准。
+    // 多泵一帧留点余量，免得断言钉死在准确的帧数上。
+    pump_frames(&ws, 4, cx);
+
+    cx.read(|app| {
+        let ws = ws.read(app);
+        assert_eq!(ws.active_index(), ACTIVE, "激活项应当来自 workspace.json");
+        let scroll = ws.tab_scroll();
+        let offset = scroll.offset().x;
+        let viewport = scroll.bounds();
+        let item = scroll
+            .bounds_for_item(ACTIVE)
+            .expect("画过一帧后每个标签都该量到布局");
+        assert!(
+            viewport.size.width < item.right() - scroll.bounds().left(),
+            "16 个长标签在 900 px 下必须溢出，否则这条测不到滚动"
+        );
+        // `child_bounds` 记的是没套滚动偏移的布局位置，可视区判定要自己加回 offset
+        // （与 gpui `ScrollHandle::scroll_to_active_item` 的口径一致）
+        assert!(
+            item.left() + offset >= viewport.left() - px(0.5)
+                && item.right() + offset <= viewport.right() + px(0.5),
+            "重启后激活标签要落在可视区内：item = {item:?}，offset = {offset:?}，viewport = {viewport:?}"
+        );
+    });
+}
+
+/// 粘一条 curl → 解析 → 导入成新 Tab。整条链路走一遍。
+#[gpui_kit::test]
+fn importing_a_curl_command_opens_a_new_tab(cx: &mut TestAppContext) {
+    let (cx, store, _dir) = init_with_store(cx);
+    let ws = cx.update(|window, cx| cx.new(|cx| Workspace::new(window, cx)));
+    // 当前 Tab 先填点东西：导入不该把它冲掉
+    let original = cx.read(|app| ws.read(app).active_tab());
+    change_url(&original, "https://api.test/keep-me", cx);
+
+    let cmd = r#"curl -X POST 'https://api.example.com/v1/users?page=2' \
+  -H 'Content-Type: application/json' \
+  -H 'X-Token: abc' \
+  --data-raw '{"name":"cat"}' \
+  --compressed"#;
+    cx.update(|window, cx| {
+        ws.read(cx)
+            .curl_sheet
+            .clone()
+            .update(cx, |sheet, cx| sheet.set_text_for_test(cmd, window, cx))
+    });
+
+    // 解析结果先在抽屉里显示，运行时选项如实报出来
+    cx.read(|app| {
+        let sheet = ws.read(app).curl_sheet.read(app);
+        assert!(sheet.error().is_none());
+        let draft = sheet.draft().expect("解析成功");
+        assert_eq!(draft.method, Method::Post);
+        assert_eq!(draft.url, "https://api.example.com/v1/users");
+        assert_eq!(sheet.warnings().len(), 1, "--compressed 属于发送设置");
+    });
+
+    cx.update(|window, cx| ws.update(cx, |ws, cx| ws.import_curl(window, cx)));
+
+    cx.read(|app| {
+        let w = ws.read(app);
+        assert_eq!(w.tab_count(), 2, "导入开的是新 Tab");
+        let tab = w.active_tab().read(app);
+        assert!(tab.dirty, "导入的 Tab 是未保存状态");
+        assert_eq!(tab.saved_id, None);
+        // 原来的 Tab 原样保留
+        assert_eq!(
+            w.tab_at(0).read(app).url.read(app).value(),
+            "https://api.test/keep-me"
+        );
+    });
+
+    // 抽屉清空，下次打开不会还留着上一条命令
+    cx.read(|app| assert!(ws.read(app).curl_sheet.read(app).draft().is_none()));
+
+    // 新 Tab 的草稿要落盘，重启后还在
+    assert!(store.flush());
+    let drafts = store.load_all().drafts;
+    assert!(
+        drafts
+            .iter()
+            .any(|d| d.draft.url == "https://api.example.com/v1/users"),
+        "导入的请求没有落草稿"
+    );
+}
+
+/// 解析不出来时不能给出草稿——「导入」按钮就是靠它置灰的。
+#[gpui_kit::test]
+fn a_command_that_is_not_curl_yields_no_draft(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let ws = cx.update(|window, cx| cx.new(|cx| Workspace::new(window, cx)));
+    let sheet = cx.read(|app| ws.read(app).curl_sheet.clone());
+
+    cx.update(|window, cx| {
+        sheet.update(cx, |s, cx| {
+            s.set_text_for_test("wget https://x.com", window, cx)
+        })
+    });
+    cx.read(|app| {
+        let s = sheet.read(app);
+        assert!(s.draft().is_none());
+        assert!(s.error().is_some());
+    });
+
+    // 导入是空操作，不会凭空开 Tab
+    let before = cx.read(|app| ws.read(app).tab_count());
+    cx.update(|window, cx| ws.update(cx, |ws, cx| ws.import_curl(window, cx)));
+    cx.read(|app| assert_eq!(ws.read(app).tab_count(), before));
+
+    // 清空输入后回到「没有内容」而不是「解析失败」
+    cx.update(|window, cx| sheet.update(cx, |s, cx| s.set_text_for_test("", window, cx)));
+    cx.read(|app| {
+        let s = sheet.read(app);
+        assert!(s.draft().is_none());
+        assert!(s.error().is_none(), "空输入不是错误");
+    });
+}
+
+/// 组织操作（移动/重命名/解散分类）批量重写文件但不碰 updated_at（spec §3）：
+/// updated_at 表达「内容何时改过」，组织操作不算，列表排序因此不被搅乱。
+#[gpui_kit::test]
+fn organizing_saved_requests_rewrites_files_without_touching_updated_at(cx: &mut TestAppContext) {
+    let (cx, store, _dir) = init_with_store(cx);
+    let ws = cx.update(|window, cx| cx.new(|cx| Workspace::new(window, cx)));
+    let tab = cx.read(|app| ws.read(app).active_tab());
+    change_url(&tab, "https://api.test/a", cx);
+    let id = cx
+        .update(|_, cx| {
+            ws.update(cx, |ws, cx| {
+                ws.finish_save(tab.clone(), "甲".into(), None, cx)
+            })
+        })
+        .unwrap();
+    let before = cx.read(|app| ws.read(app).saved()[0].updated_at);
+
+    // 移入分类
+    cx.update(|_, cx| {
+        ws.update(cx, |ws, cx| {
+            ws.move_saved_to_group(id, Some("订单".into()), cx)
+        })
+    });
+    assert!(store.flush());
+    let loaded = store.load_all();
+    assert_eq!(loaded.requests[0].group.as_deref(), Some("订单"));
+    assert_eq!(
+        loaded.requests[0].updated_at, before,
+        "移动分类不碰 updated_at"
+    );
+
+    // 重命名分类
+    cx.update(|_, cx| ws.update(cx, |ws, cx| ws.rename_group("订单", "  订单v2 ", cx)));
+    assert!(store.flush());
+    let loaded = store.load_all();
+    assert_eq!(
+        loaded.requests[0].group.as_deref(),
+        Some("订单v2"),
+        "重命名 trim 后生效"
+    );
+    assert_eq!(loaded.requests[0].updated_at, before);
+
+    // 解散分类：成员回未分类，请求不删
+    cx.update(|_, cx| ws.update(cx, |ws, cx| ws.dissolve_group("订单v2", cx)));
+    assert!(store.flush());
+    let loaded = store.load_all();
+    assert_eq!(loaded.requests.len(), 1);
+    assert_eq!(loaded.requests[0].group, None);
+    assert_eq!(loaded.requests[0].updated_at, before);
+}
+
+/// 重命名到已存在的分类名 = 合并（推导模型下同名即同类，spec §3）。
+#[gpui_kit::test]
+fn renaming_a_group_onto_another_merges_them(cx: &mut TestAppContext) {
+    let (cx, store, _dir) = init_with_store(cx);
+    let ws = cx.update(|window, cx| cx.new(|cx| Workspace::new(window, cx)));
+    let tab = cx.read(|app| ws.read(app).active_tab());
+    change_url(&tab, "https://api.test/a", cx);
+    let a = cx
+        .update(|_, cx| {
+            ws.update(cx, |ws, cx| {
+                ws.finish_save(tab.clone(), "甲".into(), None, cx)
+            })
+        })
+        .unwrap();
+    cx.update(|window, cx| ws.update(cx, |ws, cx| ws.new_tab(window, cx)));
+    let tab2 = cx.read(|app| ws.read(app).active_tab());
+    change_url(&tab2, "https://api.test/b", cx);
+    let b = cx
+        .update(|_, cx| {
+            ws.update(cx, |ws, cx| {
+                ws.finish_save(tab2.clone(), "乙".into(), None, cx)
+            })
+        })
+        .unwrap();
+    cx.update(|_, cx| {
+        ws.update(cx, |ws, cx| {
+            ws.move_saved_to_group(a, Some("旧".into()), cx);
+            ws.move_saved_to_group(b, Some("新".into()), cx);
+            ws.rename_group("旧", "新", cx);
+        })
+    });
+    assert!(store.flush());
+    let loaded = store.load_all();
+    assert!(
+        loaded
+            .requests
+            .iter()
+            .all(|r| r.group.as_deref() == Some("新"))
+    );
+}
+
+/// 选中分类的最后一个成员被删 / 移走 / 解散后，过滤器回退「全部」（spec §7）。
+#[gpui_kit::test]
+fn saved_filter_falls_back_to_all_when_the_group_vanishes(cx: &mut TestAppContext) {
+    let (cx, _store, _dir) = init_with_store(cx);
+    let ws = cx.update(|window, cx| cx.new(|cx| Workspace::new(window, cx)));
+    let tab = cx.read(|app| ws.read(app).active_tab());
+    change_url(&tab, "https://api.test/a", cx);
+    let id = cx
+        .update(|_, cx| {
+            ws.update(cx, |ws, cx| {
+                ws.finish_save(tab.clone(), "甲".into(), None, cx)
+            })
+        })
+        .unwrap();
+    cx.update(|_, cx| {
+        ws.update(cx, |ws, cx| {
+            ws.move_saved_to_group(id, Some("g".into()), cx);
+            ws.set_saved_filter(SavedFilter::Group("g".into()), cx);
+        })
+    });
+    cx.read(|app| {
+        assert_eq!(ws.read(app).filtered_saved_indices(), vec![0]);
+    });
+    // 移出分类 → 分类消失 → 回退 All
+    cx.update(|_, cx| ws.update(cx, |ws, cx| ws.move_saved_to_group(id, None, cx)));
+    cx.read(|app| {
+        assert_eq!(*ws.read(app).saved_filter(), SavedFilter::All);
+    });
+    // 再试删除路径
+    cx.update(|_, cx| {
+        ws.update(cx, |ws, cx| {
+            ws.move_saved_to_group(id, Some("h".into()), cx);
+            ws.set_saved_filter(SavedFilter::Group("h".into()), cx);
+            ws.delete_saved(id, cx);
+        })
+    });
+    cx.read(|app| {
+        assert_eq!(*ws.read(app).saved_filter(), SavedFilter::All);
+    });
+}
+
+/// 两栏面板：分类列画出「全部/未分类/分类」，切换过滤后请求列行数跟着变。
+#[gpui_kit::test]
+fn saved_panel_draws_two_panes_and_filters_rows(cx: &mut TestAppContext) {
+    let (cx, _store, _dir) = init_with_store(cx);
+    let ws = cx.update(|window, cx| cx.new(|cx| Workspace::new(window, cx)));
+    // 两条请求：一条进「订单」，一条未分类
+    let tab = cx.read(|app| ws.read(app).active_tab());
+    change_url(&tab, "https://api.test/a", cx);
+    let a = cx
+        .update(|_, cx| {
+            ws.update(cx, |ws, cx| {
+                ws.finish_save(tab.clone(), "甲".into(), None, cx)
+            })
+        })
+        .unwrap();
+    cx.update(|window, cx| ws.update(cx, |ws, cx| ws.new_tab(window, cx)));
+    let tab2 = cx.read(|app| ws.read(app).active_tab());
+    change_url(&tab2, "https://api.test/b", cx);
+    cx.update(|_, cx| {
+        ws.update(cx, |ws, cx| {
+            ws.finish_save(tab2.clone(), "乙".into(), None, cx);
+            ws.move_saved_to_group(a, Some("订单".into()), cx);
+            ws.toggle_sidebar(cx);
+        })
+    });
+    cx.update(|window, cx| window.blur(cx));
+
+    let draw = |cx: &mut VisualTestContext| {
+        let element = ws.clone();
+        cx.draw(point(px(0.), px(0.)), size(px(1200.), px(800.)), |_, _| {
+            element.into_any_element()
+        });
+    };
+    // 「全部」：两行
+    draw(cx);
+    cx.read(|app| {
+        let laid_out = ws
+            .read(app)
+            .saved_scroll()
+            .0
+            .borrow()
+            .last_item_size
+            .expect("saved list was laid out");
+        assert_eq!(laid_out.contents.height, px(SAVED_ROW_HEIGHT * 2.));
+    });
+    // 分类列画出来了（debug_selector 锚点）
+    assert!(
+        cx.debug_bounds("saved-groups").is_some(),
+        "分类列应当画了出来"
+    );
+
+    // 切到「订单」：一行
+    cx.update(|_, cx| {
+        ws.update(cx, |ws, cx| {
+            ws.set_saved_filter(SavedFilter::Group("订单".into()), cx)
+        })
+    });
+    draw(cx);
+    cx.read(|app| {
+        let laid_out = ws
+            .read(app)
+            .saved_scroll()
+            .0
+            .borrow()
+            .last_item_size
+            .expect("saved list was laid out");
+        assert_eq!(laid_out.contents.height, px(SAVED_ROW_HEIGHT));
+    });
+}
+
+/// 宽度常量按 spec §4.3 调整。
+#[test]
+fn sidebar_width_constants_match_spec() {
+    assert_eq!(SIDEBAR_DEFAULT_WIDTH, 360.);
+    assert_eq!(SIDEBAR_MIN_WIDTH, 280.);
+    assert_eq!(SIDEBAR_MAX_WIDTH, 560.);
+}
+
+/// 没装全局时返回空集；`update` 写盘 + 装全局；无变化不写。
+#[gpui_kit::test]
+fn variables_update_persists_and_no_change_skips_write(cx: &mut TestAppContext) {
+    let (cx, store, _dir) = init_with_store(cx);
+    cx.read(|app| assert!(variables::variables(app).globals.is_empty()));
+    cx.update(|_, app| {
+        variables::update(app, |s| s.globals.push(Variable::new("host", "h")));
+    });
+    assert!(store.flush());
+    assert_eq!(store.write_count(), 1);
+    let on_disk = store.load_all().variables.unwrap();
+    assert_eq!(on_disk.globals[0].value, "h");
+    cx.update(|_, app| variables::update(app, |_| {}));
+    assert!(store.flush());
+    assert_eq!(store.write_count(), 1, "没变化不该再写一次");
+}
+
+#[gpui_kit::test]
+fn resolve_layers_environment_over_group_over_global(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    cx.update(|_, app| {
+        variables::update(app, |s| {
+            s.globals = vec![Variable::new("code", "200"), Variable::new("host", "h")];
+            s.groups
+                .insert("g".into(), vec![Variable::new("code", "418")]);
+            let mut env = Environment::new("dev");
+            env.variables.push(Variable::new("code", "503"));
+            s.active_environment = Some(env.id);
+            s.environments.push(env);
+        });
+    });
+    let draft = RequestDraft {
+        url: "http://{{host}}/status/{{code}}?x={{nope}}".into(),
+        ..Default::default()
+    };
+    cx.read(|app| {
+        let r = variables::resolve(app, Some("g"), draft.clone());
+        assert_eq!(r.draft.url, "http://h/status/503?x={{nope}}");
+        assert!(r.unresolved.contains("nope"));
+        let r = variables::resolve(app, None, draft.clone());
+        assert_eq!(r.draft.url, "http://h/status/503?x={{nope}}");
+    });
+    cx.update(|_, app| variables::set_active_environment(app, None));
+    cx.read(|app| {
+        assert_eq!(
+            variables::resolve(app, Some("g"), draft.clone()).draft.url,
+            "http://h/status/418?x={{nope}}"
+        );
+        assert_eq!(
+            variables::resolve(app, None, draft.clone()).draft.url,
+            "http://h/status/200?x={{nope}}"
+        );
+    });
+}
+
+/// 切换器菜单动作：选环境 → 激活；选「无环境」→ 清空。`environment_label` 直接读全局，
+/// 但标签栏要跟着重绘，所以顺带断言 `Workspace` 在全局变化（哪怕不经 `select_environment`）
+/// 时也会被 `cx.notify()` 唤醒。
+#[gpui_kit::test]
+fn environment_switcher_activates_and_clears(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let ws = cx.update(|window, cx| cx.new(|cx| Workspace::new(window, cx)));
+    let id = cx.update(|_, app| {
+        let mut id = None;
+        variables::update(app, |s| {
+            let env = Environment::new("dev");
+            id = Some(env.id);
+            s.environments.push(env);
+        });
+        id.unwrap()
+    });
+    cx.update(|window, cx| ws.update(cx, |ws, cx| ws.select_environment(Some(id), window, cx)));
+    cx.read(|app| {
+        assert_eq!(variables::variables(app).active_environment, Some(id));
+        assert_eq!(ws.read(app).environment_label(app).as_ref(), "dev");
+    });
+
+    // 不经 `select_environment`、直接改全局：`environment_label` 自己读全局，不管有没有
+    // 订阅都会返回新值，所以真正要钉住的是「标签栏会不会重绘」——数一数 `Workspace` 收到
+    // 几次 `cx.notify()`，而不是再读一遍 `environment_label`（那样订阅摘掉测试也照样绿）。
+    let notified = Rc::new(Cell::new(0));
+    let counter = notified.clone();
+    let _sub = cx.update(|_, cx| cx.observe(&ws, move |_, _| counter.set(counter.get() + 1)));
+    cx.update(|_, app| variables::set_active_environment(app, None));
+    cx.run_until_parked();
+    assert!(
+        notified.get() > 0,
+        "Workspace 必须观察 VariablesHandle 并在它变化时 notify，标签栏才会跟着重绘"
+    );
+    cx.read(|app| {
+        let _locale = crate::i18n::locale_test_lock();
+        assert_eq!(variables::variables(app).active_environment, None);
+        assert_eq!(
+            ws.read(app).environment_label(app).as_ref(),
+            "No environment"
+        );
+    });
+}
+
+/// `select_environment` 在「生成代码」抽屉开着时要立刻刷新，否则抽屉里显示的还是切换前
+/// 那个环境展开出来的请求（`refresh_code_sheet` 本身只在 `open_tool == CodeGen` 时才调用，
+/// 见 `Workspace::select_environment`）。
+#[gpui_kit::test]
+fn select_environment_refreshes_the_open_code_sheet(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let (_dev_id, prod_id) = cx.update(|_, app| {
+        let mut dev = Environment::new("dev");
+        dev.variables.push(Variable::new("host", "dev.test"));
+        let mut prod = Environment::new("prod");
+        prod.variables.push(Variable::new("host", "prod.test"));
+        let (dev_id, prod_id) = (dev.id, prod.id);
+        variables::update(app, |s| {
+            s.active_environment = Some(dev_id);
+            s.environments = vec![dev, prod];
+        });
+        (dev_id, prod_id)
+    });
+
+    // `open_code_sheet` 走 `window.open_sheet`，落到 `Root::update`——没有 `Root` 的裸测试
+    // 窗口会直接 panic，所以这里要跟变量抽屉的测试一样套一层 `Root`。
+    let slot: Rc<RefCell<Option<Entity<Workspace>>>> = Rc::new(RefCell::new(None));
+    let slot_for_root = slot.clone();
+    let (_, cx) = cx.add_window_view(move |window, cx| {
+        let ws = cx.new(|cx| Workspace::new(window, cx));
+        *slot_for_root.borrow_mut() = Some(ws.clone());
+        Root::new(ws, window, cx)
+    });
+    let ws = slot
+        .borrow_mut()
+        .take()
+        .expect("workspace created inside the root view");
+
+    let tab = cx.read(|app| ws.read(app).active_tab());
+    change_url(&tab, "https://{{host}}/v1", cx);
+
+    cx.update(|window, cx| {
+        ws.update(cx, |ws, cx| {
+            ws.open_tool_section(ToolSection::CodeGen, window, cx)
+        })
+    });
+    let code_sheet = cx.read(|app| ws.read(app).code_sheet.clone());
+    let code_text = |cx: &mut VisualTestContext| cx.read(|app| code_sheet.read(app).text().clone());
+    let before = code_text(cx);
+    assert!(before.contains("dev.test"), "{before}");
+
+    cx.update(|window, cx| {
+        ws.update(cx, |ws, cx| {
+            ws.select_environment(Some(prod_id), window, cx)
+        })
+    });
+    let after = code_text(cx);
+    assert!(after.contains("prod.test"), "{after}");
+    assert!(!after.contains("dev.test"), "{after}");
+}
+
+/// Tab 记住自己所属分类：保存 / 打开 / 改名 / 解散 / 删除都要同步，变量表也跟着联动。
+#[gpui_kit::test]
+fn saved_group_follows_the_request_and_variables_follow_the_group(cx: &mut TestAppContext) {
+    let (cx, store, _dir) = init_with_store(cx);
+    let ws = cx.update(|window, cx| cx.new(|cx| Workspace::new(window, cx)));
+    let tab = cx.read(|app| ws.read(app).active_tab());
+    change_url(&tab, "https://api.test/a", cx);
+    let id = cx
+        .update(|_, cx| {
+            ws.update(cx, |ws, cx| {
+                ws.finish_save(tab.clone(), "a".into(), Some("订单".into()), cx)
+            })
+        })
+        .unwrap();
+    cx.read(|app| assert_eq!(tab.read(app).saved_group.as_deref(), Some("订单")));
+
+    cx.update(|_, app| {
+        variables::update(app, |s| {
+            s.groups
+                .insert("订单".into(), vec![Variable::new("code", "418")]);
+        });
+    });
+    // 改名：Tab 与变量表一起搬
+    cx.update(|_, cx| ws.update(cx, |ws, cx| ws.rename_group("订单", "订单2", cx)));
+    cx.read(|app| {
+        assert_eq!(tab.read(app).saved_group.as_deref(), Some("订单2"));
+        let sets = variables::variables(app);
+        assert!(!sets.groups.contains_key("订单"));
+        assert_eq!(sets.group_vars(Some("订单2"))[0].value, "418");
+    });
+    // 移动到未分类
+    cx.update(|_, cx| ws.update(cx, |ws, cx| ws.move_saved_to_group(id, None, cx)));
+    cx.read(|app| assert_eq!(tab.read(app).saved_group, None));
+    // 分类变量在成员走光后仍保留
+    cx.read(|app| assert_eq!(variables::variables(app).group_vars(Some("订单2")).len(), 1));
+    // 解散：变量删除
+    cx.update(|_, cx| {
+        ws.update(cx, |ws, cx| {
+            ws.move_saved_to_group(id, Some("订单2".into()), cx)
+        })
+    });
+    cx.update(|_, cx| ws.update(cx, |ws, cx| ws.dissolve_group("订单2", cx)));
+    cx.read(|app| {
+        assert_eq!(tab.read(app).saved_group, None);
+        assert!(variables::variables(app).groups.is_empty());
+    });
+    // 重启恢复：从已保存请求反查
+    cx.update(|_, cx| {
+        ws.update(cx, |ws, cx| {
+            ws.move_saved_to_group(id, Some("g".into()), cx)
+        })
+    });
+    assert!(store.flush());
+    let loaded = store.load_all();
+    let ws2 = cx.update(|window, cx| cx.new(|cx| Workspace::restore(loaded, window, cx)));
+    cx.read(|app| {
+        let t = ws2.read(app).active_tab();
+        assert_eq!(t.read(app).saved_group.as_deref(), Some("g"));
+    });
+    // 删除已保存请求：分类清空
+    cx.update(|_, cx| ws2.update(cx, |ws, cx| ws.delete_saved(id, cx)));
+    cx.read(|app| assert_eq!(ws2.read(app).active_tab().read(app).saved_group, None));
+}
+
+/// 回一次固定 JSON，并把收到的请求首行（`GET /path?x HTTP/1.1`）与全部头送回来。
+pub(crate) fn echo_server(body: &'static str) -> (String, std::sync::mpsc::Receiver<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 8192];
+            let mut got = Vec::new();
+            while let Ok(n) = stream.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                got.extend_from_slice(&buf[..n]);
+                if got.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let _ = tx.send(String::from_utf8_lossy(&got).into_owned());
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-Req: abc\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(body.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+    (format!("http://{addr}"), rx)
+}
+
+/// 发送时按激活环境替换 URL / 头；未解析的名字记在 Tab 上；草稿与已保存请求仍是原文。
+#[gpui_kit::test]
+fn send_resolves_variables_and_keeps_the_draft_verbatim(cx: &mut TestAppContext) {
+    let (cx, store, _dir) = init_with_store(cx);
+    let (base, rx) = echo_server("{}");
+    cx.update(|_, app| {
+        variables::update(app, |s| {
+            s.globals.push(Variable::new("base", base.clone()));
+            s.globals.push(Variable::new("tok", "T"));
+        });
+    });
+    let tab = new_tab(cx);
+    cx.update(|window, cx| {
+        tab.update(cx, |t, cx| {
+            t.headers.update(cx, |h, cx| {
+                h.set_values(
+                    &[KeyValue::new("Authorization", "Bearer {{tok}}")],
+                    window,
+                    cx,
+                )
+            });
+        })
+    });
+    set_url_and_send(&tab, "{{base}}/users/{{missing}}", cx);
+    wait_until(cx, |cx| {
+        cx.read(|app| !tab.read(app).response.is_in_flight())
+    });
+    // 先确认请求成功：失败时服务端收不到请求，直接 recv 会永远卡住而看不到原因
+    cx.read(|app| {
+        let t = tab.read(app);
+        assert!(t.response.is_done(), "{:?}", t.response.error());
+    });
+    let received = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("echo server should have received the request");
+    assert!(
+        received.starts_with("GET /users/%7B%7Bmissing%7D%7D HTTP/1.1"),
+        "{received}"
+    );
+    assert!(
+        received.to_lowercase().contains("authorization: bearer t"),
+        "{received}"
+    );
+    cx.read(|app| {
+        let t = tab.read(app);
+        assert_eq!(
+            t.unresolved_vars.iter().cloned().collect::<Vec<_>>(),
+            vec!["missing".to_string()]
+        );
+        assert_eq!(t.draft(app).url, "{{base}}/users/{{missing}}");
+        assert_eq!(t.draft(app).headers[0].value, "Bearer {{tok}}");
+    });
+    // 草稿文件也是原文
+    cx.update(|_, cx| tab.update(cx, |t, cx| t.save_draft_now(cx)));
+    assert!(store.flush());
+    let id = cx.read(|app| tab.read(app).id);
+    assert_eq!(
+        read_draft(&store, id).unwrap().draft.url,
+        "{{base}}/users/{{missing}}"
+    );
+}
+
+/// 前置操作在发送前写变量并落盘，同一次发送里后面的替换就能用上。
+#[gpui_kit::test]
+fn pre_ops_write_variables_before_the_request_goes_out(cx: &mut TestAppContext) {
+    let (cx, store, _dir) = init_with_store(cx);
+    let (base, rx) = echo_server("{}");
+    cx.update(|_, app| {
+        variables::update(app, |s| s.globals.push(Variable::new("base", base.clone())))
+    });
+    let tab = new_tab(cx);
+    cx.update(|window, cx| {
+        tab.update(cx, |t, cx| {
+            t.pre_ops.update(cx, |o, cx| {
+                o.set_pre_ops(
+                    &[PreOp {
+                        enabled: true,
+                        kind: PreOpKind::SetVariable {
+                            scope: VarScope::Global,
+                            key: "who".into(),
+                            value: "cat-{{$randomInt}}".into(),
+                        },
+                    }],
+                    window,
+                    cx,
+                )
+            });
+        })
+    });
+    set_url_and_send(&tab, "{{base}}/hi/{{who}}", cx);
+    wait_until(cx, |cx| {
+        cx.read(|app| !tab.read(app).response.is_in_flight())
+    });
+    cx.read(|app| {
+        let t = tab.read(app);
+        assert!(t.response.is_done(), "{:?}", t.response.error());
+    });
+    let received = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("echo server should have received the request");
+    assert!(received.starts_with("GET /hi/cat-"), "{received}");
+    assert!(store.flush());
+    let who = store
+        .load_all()
+        .variables
+        .unwrap()
+        .globals
+        .iter()
+        .find(|v| v.key == "who")
+        .unwrap()
+        .value
+        .clone();
+    assert!(who.starts_with("cat-"), "{who}");
+    cx.read(|app| {
+        let t = tab.read(app);
+        assert!(t.unresolved_vars.is_empty());
+        match &t.response {
+            ResponseState::Done {
+                ops: Some(report), ..
+            } => {
+                assert_eq!(report.pre.len(), 1);
+                assert_eq!(report.pre[0].1, OpOutcome::Passed);
+                assert!(report.post.results.is_empty());
+            }
+            _ => panic!("expected Done with ops report"),
+        }
+    });
+}
+
+/// 后置操作从响应里提取变量并断言；提取结果写进 variables.json。
+#[gpui_kit::test]
+fn post_ops_extract_and_assert_then_persist(cx: &mut TestAppContext) {
+    let (cx, store, _dir) = init_with_store(cx);
+    let (base, _rx) = echo_server(r#"{"data":{"token":"T"}}"#);
+    let tab = new_tab(cx);
+    cx.update(|window, cx| {
+        tab.update(cx, |t, cx| {
+            t.post_ops.update(cx, |o, cx| {
+                o.set_post_ops(
+                    &[
+                        PostOp {
+                            enabled: true,
+                            kind: PostOpKind::Extract {
+                                scope: VarScope::Global,
+                                key: "token".into(),
+                                source: ResponseSource::JsonPath {
+                                    path: "$.data.token".into(),
+                                },
+                            },
+                        },
+                        PostOp {
+                            enabled: true,
+                            kind: PostOpKind::Extract {
+                                scope: VarScope::Environment,
+                                key: "req".into(),
+                                source: ResponseSource::Header {
+                                    name: "x-req".into(),
+                                },
+                            },
+                        },
+                        PostOp {
+                            enabled: true,
+                            kind: PostOpKind::Assert {
+                                subject: ResponseSource::Status,
+                                op: AssertOp::Equals,
+                                expected: "201".into(),
+                            },
+                        },
+                    ],
+                    window,
+                    cx,
+                )
+            });
+        })
+    });
+    set_url_and_send(&tab, &base, cx);
+    wait_until(cx, |cx| {
+        cx.read(|app| !tab.read(app).response.is_in_flight())
+    });
+    cx.read(|app| {
+        match &tab.read(app).response {
+            ResponseState::Done {
+                ops: Some(report), ..
+            } => {
+                assert_eq!(report.total(), 3);
+                // 全局提取通过；环境提取因没有激活环境被改写为跳过；断言失败
+                assert_eq!(report.passed(), 1);
+                assert_eq!(report.post.results[0].1, OpOutcome::Passed);
+                assert_eq!(
+                    report.post.results[1].1,
+                    OpOutcome::Skipped(OpSkip::NoActiveEnvironment)
+                );
+                assert!(matches!(
+                    report.post.results[2].1,
+                    OpOutcome::Failed(OpFailure::Mismatch { .. })
+                ));
+                // 只剩真正写入的提取，index 指回它的结果行
+                assert_eq!(report.post.extracted.len(), 1);
+                assert_eq!(report.post.extracted[0].index, 0);
+            }
+            _ => panic!("expected Done with ops report"),
+        }
+        // 没有激活环境：环境作用域的提取写不进去，但全局的写了
+        let sets = variables::variables(app);
+        assert_eq!(
+            sets.globals
+                .iter()
+                .find(|v| v.key == "token")
+                .unwrap()
+                .value,
+            "T"
+        );
+        assert!(sets.environments.is_empty());
+    });
+    assert!(store.flush());
+    assert_eq!(store.load_all().variables.unwrap().globals[0].key, "token");
+}
+
+/// 过期的完成回调（取消 / 重发后 generation 不匹配）不得写回提取的变量。
+#[gpui_kit::test]
+fn stale_outcome_does_not_apply_extracted_variables(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let tab = new_tab(cx);
+    let body = BodyStore::in_memory(b"{}".to_vec());
+    let meta = ResponseMeta {
+        status: 200,
+        status_text: "OK".into(),
+        headers: vec![],
+        duration: Duration::from_millis(1),
+        ttfb: None,
+        body_len: 2,
+        content_type: Some("application/json".into()),
+        http_version: None,
+        certificate: None,
+    };
+    let view = ResponseView::prepare(meta, &body);
+    let report = germal_core::ops::PostReport {
+        results: vec![],
+        extracted: vec![germal_core::ops::Extracted {
+            index: 0,
+            scope: VarScope::Global,
+            key: "leak".into(),
+            value: "x".into(),
+        }],
+    };
+    cx.update(|window, cx| {
+        tab.update(cx, |t, cx| {
+            let stale = t.generation + 1;
+            t.generation = stale + 1;
+            t.apply_outcome(stale, Ok((body, view, Some(report))), window, cx);
+        })
+    });
+    cx.read(|app| assert!(variables::variables(app).globals.is_empty()));
+}
+
+fn pre_set(scope: VarScope, key: &str, value: &str) -> PreOp {
+    PreOp {
+        enabled: true,
+        kind: PreOpKind::SetVariable {
+            scope,
+            key: key.into(),
+            value: value.into(),
+        },
+    }
+}
+
+/// URL 非法、请求根本发不出去：前置操作在副本上执行后整份丢弃，变量表不变、不写盘。
+#[gpui_kit::test]
+fn pre_ops_are_discarded_when_the_request_cannot_be_prepared(cx: &mut TestAppContext) {
+    let (cx, store, _dir) = init_with_store(cx);
+    let tab = new_tab(cx);
+    cx.update(|window, cx| {
+        tab.update(cx, |t, cx| {
+            t.pre_ops.update(cx, |o, cx| {
+                o.set_pre_ops(&[pre_set(VarScope::Global, "who", "cat")], window, cx)
+            });
+        })
+    });
+    assert!(store.flush());
+    let writes = store.write_count();
+    // 反复点发送也一样
+    for _ in 0..2 {
+        set_url_and_send(&tab, "ftp://x", cx);
+    }
+    cx.run_until_parked();
+    assert!(store.flush());
+    assert_eq!(store.write_count(), writes, "发不出去的请求不该写盘");
+    cx.read(|app| {
+        let t = tab.read(app);
+        assert!(
+            matches!(t.prepare_error, Some(RequestError::InvalidUrl(_))),
+            "{:?}",
+            t.prepare_error
+        );
+        assert!(matches!(t.response, ResponseState::Idle));
+        assert!(variables::variables(app).globals.is_empty());
+    });
+}
+
+/// 前置操作值里引用的未定义变量，与草稿里的一起进 URL 栏的「未定义变量」提示。
+#[gpui_kit::test]
+fn unresolved_vars_include_names_from_pre_op_values(cx: &mut TestAppContext) {
+    let (cx, _store, _dir) = init_with_store(cx);
+    let tab = new_tab(cx);
+    cx.update(|window, cx| {
+        tab.update(cx, |t, cx| {
+            t.pre_ops.update(cx, |o, cx| {
+                o.set_pre_ops(&[pre_set(VarScope::Global, "who", "{{ghost}}")], window, cx)
+            });
+        })
+    });
+    set_url_and_send(&tab, &format!("{}{{{{missing}}}}", refused_url()), cx);
+    wait_until(cx, |cx| {
+        cx.read(|app| !tab.read(app).response.is_in_flight())
+    });
+    cx.read(|app| {
+        let t = tab.read(app);
+        assert_eq!(
+            t.unresolved_vars.iter().cloned().collect::<Vec<_>>(),
+            vec!["ghost".to_string(), "missing".to_string()]
+        );
+    });
+}
+
+fn extract_status(key: &str) -> PostOp {
+    PostOp {
+        enabled: true,
+        kind: PostOpKind::Extract {
+            scope: VarScope::Global,
+            key: key.into(),
+            source: ResponseSource::Status,
+        },
+    }
+}
+
+/// 网络错误：前置结果保留（写入照常生效）；后置操作全部记为「请求失败，未执行」，不提取。
+#[gpui_kit::test]
+fn request_failure_keeps_pre_results_and_marks_post_ops_not_run(cx: &mut TestAppContext) {
+    let (cx, _store, _dir) = init_with_store(cx);
+    let tab = new_tab(cx);
+    cx.update(|window, cx| {
+        tab.update(cx, |t, cx| {
+            t.pre_ops.update(cx, |o, cx| {
+                o.set_pre_ops(&[pre_set(VarScope::Global, "who", "cat")], window, cx)
+            });
+            t.post_ops.update(cx, |o, cx| {
+                o.set_post_ops(&[extract_status("leak")], window, cx)
+            });
+        })
+    });
+    set_url_and_send(&tab, &refused_url(), cx);
+    wait_until(cx, |cx| {
+        cx.read(|app| !tab.read(app).response.is_in_flight())
+    });
+    cx.read(|app| {
+        let t = tab.read(app);
+        let ResponseState::Failed {
+            error,
+            ops: Some(report),
+        } = &t.response
+        else {
+            panic!("expected Failed with ops, got {:?}", t.response.error());
+        };
+        assert!(
+            matches!(error, RequestError::ConnectionRefused(_)),
+            "{error:?}"
+        );
+        assert_eq!(report.pre.len(), 1);
+        assert_eq!(report.pre[0].1, OpOutcome::Passed);
+        assert_eq!(report.post.results.len(), 1);
+        assert_eq!(
+            report.post.results[0].1,
+            OpOutcome::Skipped(OpSkip::RequestFailed)
+        );
+        assert!(report.post.extracted.is_empty());
+        let sets = variables::variables(app);
+        assert!(
+            sets.globals
+                .iter()
+                .any(|v| v.key == "who" && v.value == "cat")
+        );
+        assert!(sets.globals.iter().all(|v| v.key != "leak"));
+    });
+}
+
+/// 取消是用户主动放弃：前后置结果一并丢弃。
+#[gpui_kit::test]
+fn cancel_discards_the_ops_report(cx: &mut TestAppContext) {
+    let (cx, _store, _dir) = init_with_store(cx);
+    let tab = new_tab(cx);
+    cx.update(|window, cx| {
+        tab.update(cx, |t, cx| {
+            t.pre_ops.update(cx, |o, cx| {
+                o.set_pre_ops(&[pre_set(VarScope::Global, "who", "cat")], window, cx)
+            });
+            t.post_ops.update(cx, |o, cx| {
+                o.set_post_ops(&[extract_status("leak")], window, cx)
+            });
+        })
+    });
+    set_url_and_send(&tab, &hanging_server(), cx);
+    cx.update(|_, cx| tab.update(cx, |t, cx| t.cancel(cx)));
+    std::thread::sleep(Duration::from_millis(50));
+    cx.run_until_parked();
+    cx.read(|app| {
+        assert!(matches!(
+            tab.read(app).response,
+            ResponseState::Failed {
+                error: RequestError::Cancelled,
+                ops: None
+            }
+        ));
+    });
+}
+
+/// 「操作」页签只在这次响应真的挂了报告时出现（纯函数部分）。
+#[test]
+fn ops_section_only_appears_when_a_report_exists() {
+    assert_eq!(
+        ResponseSection::visible(false, false),
+        vec![ResponseSection::Body, ResponseSection::Headers]
+    );
+    assert_eq!(
+        ResponseSection::visible(true, true),
+        vec![
+            ResponseSection::Body,
+            ResponseSection::Headers,
+            ResponseSection::Certificate,
+            ResponseSection::Ops
+        ]
+    );
+}
+
+/// 请求失败时前置结果与「请求失败，未执行」的后置结果一起挂在 `Failed` 上，
+/// `ops_report()` 认得到，「操作」页签也该出现。
+#[gpui_kit::test]
+fn failed_response_still_exposes_the_ops_report(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let tab = new_tab(cx);
+    let post_ops = vec![PostOp {
+        enabled: true,
+        kind: PostOpKind::Assert {
+            subject: ResponseSource::Status,
+            op: AssertOp::Equals,
+            expected: "200".into(),
+        },
+    }];
+    cx.update(|_, cx| {
+        tab.update(cx, |t, cx| {
+            t.response = ResponseState::Failed {
+                error: RequestError::Timeout,
+                ops: Some(OpsReport {
+                    pre: vec![],
+                    post: germal_core::ops::skip_all(&post_ops),
+                }),
+            };
+            cx.notify();
+        })
+    });
+    cx.read(|app| {
+        let t = tab.read(app);
+        assert!(t.ops_report().is_some());
+    });
+    assert!(ResponseSection::visible(false, true).contains(&ResponseSection::Ops));
+}
+
+/// `persist == false`（variables.json 在但读不出来）时只改内存、不写盘；正常安装照常写。
+#[gpui_kit::test]
+fn variables_installed_without_persist_never_write(cx: &mut TestAppContext) {
+    let (cx, store, _dir) = init_with_store(cx);
+    let writes = store.write_count();
+    cx.update(|_, app| {
+        variables::install(app, None, false);
+        variables::update(app, |s| s.globals.push(Variable::new("a", "1")));
+    });
+    assert!(store.flush());
+    assert_eq!(store.write_count(), writes, "不可写时不该写盘");
+    cx.read(|app| assert_eq!(variables::variables(app).globals[0].value, "1"));
+    // 后续改动也保持不写
+    cx.update(|_, app| variables::update(app, |s| s.globals[0].value = "2".into()));
+    assert!(store.flush());
+    assert_eq!(store.write_count(), writes);
+
+    cx.update(|_, app| {
+        variables::install(app, None, true);
+        variables::update(app, |s| s.globals.push(Variable::new("b", "2")));
+    });
+    assert!(store.flush());
+    assert_eq!(store.write_count(), writes + 1);
+    assert_eq!(store.load_all().variables.unwrap().globals[0].key, "b");
+}
+
+/// 读取失败且文件仍在原处 → 不落盘；隔离改名后的损坏文件、别的文件出错 → 照常落盘。
+#[test]
+fn variables_persist_only_when_the_file_is_not_left_unreadable() {
+    use germal_core::store::LoadError;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("variables.json");
+    let err = |p: &std::path::Path| LoadError {
+        path: p.to_path_buf(),
+        message: "Couldn't read file".into(),
+    };
+    // 没有错误
+    assert!(variables::should_persist(&path, &[]));
+    // 出错但文件已不在原处（损坏文件被改名隔离）
+    assert!(variables::should_persist(&path, &[err(&path)]));
+    std::fs::write(&path, b"{}").unwrap();
+    // 文件在、但读取失败
+    assert!(!variables::should_persist(&path, &[err(&path)]));
+    // 出错的是别的文件
+    assert!(variables::should_persist(
+        &path,
+        &[err(&dir.path().join("settings.json"))]
+    ));
+}
+
+/// 保存到分类的请求：后置提取到「分类」作用域，写进该分类的变量表并落盘。
+#[gpui_kit::test]
+fn post_ops_extract_into_the_saved_group(cx: &mut TestAppContext) {
+    let (cx, store, _dir) = init_with_store(cx);
+    let (base, _rx) = echo_server(r#"{"data":{"token":"T"}}"#);
+    let ws = cx.update(|window, cx| cx.new(|cx| Workspace::new(window, cx)));
+    let tab = cx.read(|app| ws.read(app).active_tab());
+    change_url(&tab, &base, cx);
+    cx.update(|window, cx| {
+        tab.update(cx, |t, cx| {
+            t.post_ops.update(cx, |o, cx| {
+                o.set_post_ops(
+                    &[PostOp {
+                        enabled: true,
+                        kind: PostOpKind::Extract {
+                            scope: VarScope::Group,
+                            key: "token".into(),
+                            source: ResponseSource::JsonPath {
+                                path: "$.data.token".into(),
+                            },
+                        },
+                    }],
+                    window,
+                    cx,
+                )
+            });
+        })
+    });
+    cx.update(|_, cx| {
+        ws.update(cx, |ws, cx| {
+            ws.finish_save(tab.clone(), "login".into(), Some("g".into()), cx)
+        })
+    })
+    .unwrap();
+    cx.update(|window, cx| tab.update(cx, |t, cx| t.send(window, cx)));
+    wait_until(cx, |cx| {
+        cx.read(|app| !tab.read(app).response.is_in_flight())
+    });
+    cx.read(|app| {
+        let t = tab.read(app);
+        match &t.response {
+            ResponseState::Done {
+                ops: Some(report), ..
+            } => {
+                assert_eq!(report.post.results[0].1, OpOutcome::Passed);
+                assert_eq!(report.post.extracted.len(), 1);
+            }
+            _ => panic!("expected Done with ops, got {:?}", t.response.error()),
+        }
+        let sets = variables::variables(app);
+        assert_eq!(sets.group_vars(Some("g")), [Variable::new("token", "T")]);
+        assert!(sets.globals.is_empty());
+    });
+    assert!(store.flush());
+    let on_disk = store.load_all().variables.unwrap();
+    assert_eq!(on_disk.group_vars(Some("g")), [Variable::new("token", "T")]);
+}
+
+/// 前后置操作表是子实体：程序化载入草稿不置脏，但用户在表格里改动（发出 `Changed`）要置脏，
+/// 且改动经 `draft()` 能读回来。
+#[gpui_kit::test]
+fn editing_ops_marks_the_tab_dirty_and_round_trips_through_draft(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let tab = new_tab(cx);
+    let ops = vec![PreOp {
+        enabled: true,
+        kind: PreOpKind::SetVariable {
+            scope: VarScope::Global,
+            key: "a".into(),
+            value: "1".into(),
+        },
+    }];
+    cx.update(|window, cx| {
+        tab.update(cx, |t, cx| {
+            t.load_draft(
+                &RequestDraft {
+                    pre_ops: ops.clone(),
+                    ..Default::default()
+                },
+                window,
+                cx,
+            );
+            assert!(!t.dirty, "程序化载入不置脏");
+            assert_eq!(t.draft(cx).pre_ops, ops);
+            // 模拟用户改动：表格发 Changed → Tab 置脏
+            t.pre_ops.update(cx, |_, cx| {
+                cx.emit(crate::ui::ops_table::OpsTableEvent::Changed)
+            });
+        })
+    });
+    cx.read(|app| assert!(tab.read(app).dirty));
+}
+
+/// 改 URL / 重新载入草稿时，上一次发送留下的未定义变量提示与校验错误一起清掉。
+#[gpui_kit::test]
+fn url_edits_and_load_draft_clear_unresolved_vars(cx: &mut TestAppContext) {
+    let cx = init(cx);
+    let tab = new_tab(cx);
+    let send_bad = |cx: &mut VisualTestContext| {
+        set_url_and_send(&tab, "ftp://{{nope}}/", cx);
+        cx.read(|app| {
+            let t = tab.read(app);
+            assert!(t.prepare_error.is_some());
+            assert!(t.unresolved_vars.contains("nope"));
+        });
+    };
+    send_bad(cx);
+    change_url(&tab, "https://api.test/", cx);
+    cx.read(|app| {
+        let t = tab.read(app);
+        assert!(t.prepare_error.is_none());
+        assert!(t.unresolved_vars.is_empty(), "{:?}", t.unresolved_vars);
+    });
+
+    send_bad(cx);
+    cx.update(|window, cx| {
+        tab.update(cx, |t, cx| {
+            t.load_draft(&RequestDraft::default(), window, cx)
+        })
+    });
+    cx.read(|app| {
+        let t = tab.read(app);
+        assert!(t.prepare_error.is_none());
+        assert!(t.unresolved_vars.is_empty(), "{:?}", t.unresolved_vars);
+    });
+}

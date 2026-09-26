@@ -1,0 +1,1461 @@
+//! 一个请求 Tab 的全部状态：输入组件实体、响应状态、视图选择。
+
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
+
+use germal_core::body::pretty::{is_valid_json, pretty_json};
+use germal_core::body::tier::{ViewTier, mib_label};
+use germal_core::detect::ContentKind;
+use germal_core::http::{self, HttpResponse, RequestError, guess_content_type};
+use germal_core::model::{
+    BodyKind, HttpVersionPref, Method, PostOp, PreOp, RawFormat, RequestDraft, SplitDirection,
+    TabDraft, TabId, Ulid,
+};
+use germal_core::ops::{self, OpOutcome};
+use germal_core::url::extract_path_params;
+// 显式导入而非 `use gpui_kit::*`：本文件内 `#[cfg(test)] mod tests { use super::*; #[test] .. }`
+// 若通过通配符引入 `gpui_kit::test`（gpui 重导出的 `#[proc_macro_attribute]`），会与标准库的
+// `#[test]` 属性同名冲突，导致该属性宏对自身生成的 `#[test]` 反复展开直至递归上限溢出。
+use gpui_kit::component::IndexPath;
+use gpui_kit::component::input::{EditorState, InputEvent, InputState, Search};
+use gpui_kit::component::resizable::{h_resizable, resizable_panel, v_resizable};
+use gpui_kit::component::select::{SelectEvent, SelectState};
+use gpui_kit::component::v_flex;
+use gpui_kit::{
+    App, AppContext, Context, Entity, Global, IntoElement, ListAlignment, ListState, ParentElement,
+    PathPromptOptions, Render, ScrollStrategy, SharedString, Styled, Subscription, Task,
+    UniformListScrollHandle, Window, div, px,
+};
+
+use tokio::sync::mpsc;
+
+use crate::bridge;
+use crate::i18n::{Locale, tr};
+use crate::state::response::{
+    CancelFlag, OpsReport, Prepared, ResponseState, ResponseView, SseLive, prepare_guarded,
+};
+use crate::state::settings;
+use crate::state::store::store;
+use crate::state::variables;
+use crate::ui::kv_table::{KvPlaceholder, KvTable, KvTableEvent};
+use crate::ui::ops_table::{OpsMode, OpsTable, OpsTableEvent};
+use crate::ui::selectable_lines::LinesSelection;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestSection {
+    Params,
+    Headers,
+    Body,
+    Ops,
+}
+
+impl RequestSection {
+    pub const ALL: [RequestSection; 4] = [
+        RequestSection::Params,
+        RequestSection::Headers,
+        RequestSection::Body,
+        RequestSection::Ops,
+    ];
+    pub fn index(self) -> usize {
+        Self::ALL.iter().position(|s| *s == self).unwrap_or(0)
+    }
+    pub fn from_index(ix: usize) -> Self {
+        Self::ALL.get(ix).copied().unwrap_or(RequestSection::Params)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseSection {
+    Body,
+    Headers,
+    Certificate,
+    Ops,
+}
+
+impl ResponseSection {
+    /// 当前能看到的页签。证书页签只在真拿到了对端证书时出现——http 请求、
+    /// 以及打开校验后握手失败的 https 请求都没有证书可看；「操作」页签只在这次响应挂了
+    /// 前后置操作报告时出现（两边都没有启用的操作时不出现）。
+    pub fn visible(has_certificate: bool, has_ops: bool) -> Vec<ResponseSection> {
+        let mut sections = vec![ResponseSection::Body, ResponseSection::Headers];
+        if has_certificate {
+            sections.push(ResponseSection::Certificate);
+        }
+        if has_ops {
+            sections.push(ResponseSection::Ops);
+        }
+        sections
+    }
+}
+
+/// SSE 响应 Body 区的三种视图；`ALL` 的顺序就是段控顺序。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SseBodyMode {
+    /// 大模型流的 delta 拼装文本（默认；拼不出文本时回落到 Events）。
+    Text,
+    /// 逐事件列表（event 名 + data）。
+    Events,
+    /// 原始 text/event-stream 文本。
+    Raw,
+}
+
+impl SseBodyMode {
+    pub const ALL: [SseBodyMode; 3] = [SseBodyMode::Text, SseBodyMode::Events, SseBodyMode::Raw];
+
+    pub fn index(self) -> usize {
+        Self::ALL.iter().position(|m| *m == self).unwrap_or(0)
+    }
+
+    pub fn from_index(ix: usize) -> Self {
+        Self::ALL.get(ix).copied().unwrap_or(SseBodyMode::Text)
+    }
+
+    pub fn label(self) -> SharedString {
+        match self {
+            SseBodyMode::Text => tr!("response.sse_mode_text"),
+            SseBodyMode::Events => tr!("response.sse_mode_events"),
+            SseBodyMode::Raw => tr!("response.sse_mode_raw"),
+        }
+    }
+}
+
+/// Body 模式；`ALL` 的顺序就是模式条顺序（Postman 顺序）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BodyMode {
+    None,
+    FormData,
+    FormUrlEncoded,
+    Raw,
+    Binary,
+}
+
+impl BodyMode {
+    pub const ALL: [BodyMode; 5] = [
+        BodyMode::None,
+        BodyMode::FormData,
+        BodyMode::FormUrlEncoded,
+        BodyMode::Raw,
+        BodyMode::Binary,
+    ];
+    pub fn index(self) -> usize {
+        Self::ALL.iter().position(|m| *m == self).unwrap_or(0)
+    }
+    pub fn from_index(ix: usize) -> Self {
+        Self::ALL.get(ix).copied().unwrap_or(BodyMode::None)
+    }
+}
+
+/// 响应编辑器按语言各一个（gpui-component 的 EditorState 创建后不能换语言）。
+const RESPONSE_LANGUAGES: [&str; 3] = ["json", "html", "text"];
+
+/// 在途时状态行重绘的间隔（实时耗时）。
+const TICK_INTERVAL: Duration = Duration::from_millis(100);
+
+/// 文本 Body 超过此大小时提示改用文件 Body（spec §6.5）。
+pub const BODY_HINT_BYTES: usize = 10 * 1024 * 1024;
+
+pub fn body_hint_for(len: usize) -> Option<BodyHint> {
+    (len > BODY_HINT_BYTES).then_some(BodyHint::TooLarge)
+}
+
+/// Body 区的非阻塞提示。存枚举而不是文案：切换界面语言后渲染时重新翻译。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BodyHint {
+    /// raw 文本超过 [`BODY_HINT_BYTES`]。
+    TooLarge,
+    /// form-data 模式下用户自设了 Content-Type（发送时该头会被剔除，见 core::http）。
+    FormDataContentType,
+    /// 点了格式化，但 raw 请求体不是合法 JSON。下一次编辑就会被 `refresh_body_hint` 清掉。
+    InvalidJson,
+}
+
+impl BodyHint {
+    pub fn text(self) -> SharedString {
+        match self {
+            BodyHint::TooLarge => tr!(
+                "request.hint_body_too_large",
+                size = mib_label(BODY_HINT_BYTES as u64)
+            ),
+            BodyHint::FormDataContentType => tr!("request.hint_form_data_content_type"),
+            BodyHint::InvalidJson => tr!("request.hint_invalid_json"),
+        }
+    }
+}
+
+/// 顶栏"复制"按钮的目标；tooltip 按它翻译。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyTarget {
+    Body,
+    /// 落盘响应：内存里只有前面的预览部分
+    BodyPreview,
+    Headers,
+}
+
+impl CopyTarget {
+    pub fn tooltip(self) -> SharedString {
+        match self {
+            CopyTarget::Body => tr!("response.copy_body"),
+            CopyTarget::BodyPreview => tr!("response.copy_body_preview"),
+            CopyTarget::Headers => tr!("response.copy_headers"),
+        }
+    }
+}
+
+/// 工具栏右侧的一行提示。同样存枚举，渲染时翻译。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Notice {
+    /// ⌘F 在 B / C 档（没有编辑器）。
+    VirtualSearch,
+    /// ⌘F 在 SSE 的事件列表视图（uniform_list，没有编辑器）。
+    SseEventsSearch,
+    NoResponse,
+    BinarySearch,
+    /// A 档但正文为空：`render_body_view` 这时画的是「响应体为空」占位而不是编辑器，
+    /// 聚焦一个没渲染的元素没有任何反馈。
+    EmptyBodySearch,
+    SavedTo(PathBuf),
+    SaveFailed(String),
+}
+
+impl Notice {
+    pub fn text(&self) -> SharedString {
+        match self {
+            Notice::VirtualSearch => tr!("notice.virtual_search"),
+            Notice::SseEventsSearch => tr!("notice.sse_events_search"),
+            Notice::NoResponse => tr!("notice.no_response"),
+            Notice::BinarySearch => tr!("notice.binary_search"),
+            Notice::EmptyBodySearch => tr!("notice.empty_body_search"),
+            Notice::SavedTo(path) => tr!("notice.saved_to", path = path.display()),
+            Notice::SaveFailed(error) => tr!("notice.save_failed", error = error),
+        }
+    }
+}
+
+/// 编辑后到投递草稿的去抖：主线程只在窗口结束时做一次 `draft()` 快照（rope → String 拷贝），
+/// 序列化与落盘都在写入线程；写入线程再按 500 ms 合并同一 Tab 的重复写入。
+pub(crate) const DRAFT_DEBOUNCE: Duration = Duration::from_millis(300);
+
+/// 上次"保存到文件"选择的目录（进程内记忆，不落盘）；下一次保存对话框从这里打开。
+pub(crate) struct LastSaveDir(pub Option<PathBuf>);
+
+impl Global for LastSaveDir {}
+
+/// 保存对话框的起始目录：上次保存的目录，否则 home。
+fn save_dialog_dir(cx: &App) -> PathBuf {
+    cx.try_global::<LastSaveDir>()
+        .and_then(|d| d.0.clone())
+        .unwrap_or_else(|| std::env::home_dir().unwrap_or_default())
+}
+
+/// 当前的换行偏好 `(请求体, 响应体)`。
+fn wrap_prefs(cx: &App) -> (bool, bool) {
+    let s = settings::settings(cx);
+    (s.wrap_request_body, s.wrap_response_body)
+}
+
+pub struct RequestTab {
+    /// Tab 的稳定标识：也是草稿文件名 `drafts/<id>.json`。
+    pub id: TabId,
+    /// 来自哪条已保存请求（保存 / 从侧栏打开时设置；该请求被删除时清空）。
+    pub saved_id: Option<Ulid>,
+    /// 已保存请求的名字：有则作为 Tab 标题。
+    pub saved_name: Option<SharedString>,
+    /// 对应已保存请求的分类（分类级变量按它取）；未保存 / 未分类为 None。
+    /// 缓存在 Tab 上是因为 ⌘⏎ 的 listener 在 `Workspace::update` 内部 `update` 本实体，
+    /// 这里没法回读 Workspace（重入会 panic）。同步点与 `saved_name` 相同。
+    pub saved_group: Option<String>,
+    /// 自上次保存以来是否有改动；Tab 标题前显示圆点。
+    pub dirty: bool,
+    pub method: Entity<SelectState<Vec<&'static str>>>,
+    pub url: Entity<InputState>,
+    /// 发送前校验失败的错误（URL 非法 / Header 非法 / 未选文件），显示在 URL 栏下方（spec §11）；
+    /// 存错误本身，渲染时按当前语言翻译。
+    pub prepare_error: Option<RequestError>,
+    /// 上一次发送时没能解析的变量名（URL 栏下方 warning）；每次发送重算，与 `prepare_error`
+    /// 同步清空（改 URL、载入草稿）。
+    pub unresolved_vars: BTreeSet<String>,
+    /// 前置 / 后置操作表：与 [`crate::ui::ops_table::OpsTable`] 一一对应的子实体。
+    pub pre_ops: Entity<OpsTable>,
+    pub post_ops: Entity<OpsTable>,
+    /// 本次发送的前置结果，等响应到达后并进 `Done.ops` / `Failed.ops`。
+    pre_results: Vec<(PreOp, OpOutcome)>,
+    /// 本次发送的后置操作快照（期望值已替换）：请求失败时 `apply_outcome` 据它把每条
+    /// 标成「请求失败，未执行」。生命周期与 `pre_results` 相同（send 写入，apply_outcome /
+    /// cancel / clear_response 清掉）。
+    sent_post_ops: Vec<PostOp>,
+    pub path_params: Entity<KvTable>,
+    pub params: Entity<KvTable>,
+    pub headers: Entity<KvTable>,
+    pub form: Entity<KvTable>,
+    pub form_data: Entity<KvTable>,
+    pub body_mode: BodyMode,
+    pub raw_format: RawFormat,
+    /// 这次请求走哪个 HTTP 版本。刻意不进 `draft()`：它是调试时临时切换的开关，
+    /// 不属于「这条请求是什么」，跟着已保存请求落盘只会让人困惑。
+    pub http_version: HttpVersionPref,
+    /// binary Body：所选文件路径与大小（大小只用于显示）。
+    pub file_path: Option<PathBuf>,
+    pub file_size: Option<u64>,
+    /// 非阻塞的 Body 提示：raw 模式下是文本过大提示，form-data 模式下是 Content-Type 冲突提示。
+    pub body_hint: Option<BodyHint>,
+    body_editors: Vec<(RawFormat, Entity<EditorState>)>,
+    response_editors: Vec<(&'static str, Entity<EditorState>)>,
+    /// 已套用到编辑器上的换行开关 `(请求体, 响应体)`。偏好是全局的，但 `set_soft_wrap`
+    /// 只能在有 `Window` 时调用，所以由 `render` 比对这份缓存来补齐——任何一个 Tab
+    /// 改了偏好，其余 Tab 下一帧自动跟上，不需要 Workspace 逐个广播。
+    applied_wrap: (bool, bool),
+    pub request_section: RequestSection,
+    pub response_section: ResponseSection,
+    pub pretty: bool,
+    /// SSE 响应 Body 区当前的视图；跨请求保持（会话内的用户偏好）。
+    pub sse_mode: SseBodyMode,
+    /// 请求 / 响应分栏方向；由 Workspace 统一设置（工作区级设置，随 workspace.json 持久化）。
+    pub split: SplitDirection,
+    /// B/C 档行视图的滚动位置；新响应到达时回到顶部。
+    pub body_scroll: UniformListScrollHandle,
+    /// Headers 列表的状态（gpui `list`：值可换行、行高不等）；
+    /// 行数随响应变，新响应到达 / 清空时必须 `reset`（顺带回到顶部）。
+    pub headers_list: ListState,
+    /// B/C 档行视图的文本选择参与者（窗口级选择引擎的稳定句柄）
+    pub lines_selection: LinesSelection,
+    pub response: ResponseState,
+    /// 工具栏右侧的一行提示（保存结果、搜索不可用等）；重新发送时清空。
+    pub notice: Option<Notice>,
+    pub generation: u64,
+    /// 去抖中的草稿写入任务；每次改动替换（drop 即取消旧计时器）。
+    draft_save: Option<Task<()>>,
+    _subs: Vec<Subscription>,
+}
+
+impl RequestTab {
+    pub fn new(id: TabId, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let methods: Vec<&'static str> = Method::ALL.iter().map(|m| m.as_str()).collect();
+        let method = cx.new(|cx| SelectState::new(methods, Some(IndexPath::default()), window, cx));
+        let url = cx.new(|cx| InputState::new(window, cx).placeholder(tr!("url_bar.placeholder")));
+        let path_params =
+            cx.new(|cx| KvTable::new(KvPlaceholder::Param, window, cx).locked_keys(true));
+        let params = cx.new(|cx| KvTable::new(KvPlaceholder::Param, window, cx));
+        let headers = cx.new(|cx| KvTable::new(KvPlaceholder::Header, window, cx));
+        let form = cx.new(|cx| KvTable::new(KvPlaceholder::Field, window, cx));
+        let form_data =
+            cx.new(|cx| KvTable::new(KvPlaceholder::Field, window, cx).file_capable(true));
+        let pre_ops = cx.new(|cx| OpsTable::new(OpsMode::Pre, window, cx));
+        let post_ops = cx.new(|cx| OpsTable::new(OpsMode::Post, window, cx));
+
+        // 换行是全局偏好：新建的 Tab 直接按当前设置建，不必等第一次 render 去纠正
+        let wrap = wrap_prefs(cx);
+        let body_editors: Vec<(RawFormat, Entity<EditorState>)> = RawFormat::ALL
+            .iter()
+            .map(|f| {
+                let lang = f.editor_language();
+                (
+                    *f,
+                    cx.new(|cx| {
+                        EditorState::new(window, cx)
+                            .language(lang)
+                            .line_number(true)
+                            .soft_wrap(wrap.0)
+                    }),
+                )
+            })
+            .collect();
+        let response_editors = RESPONSE_LANGUAGES
+            .iter()
+            .map(|lang| {
+                (
+                    *lang,
+                    cx.new(|cx| {
+                        EditorState::new(window, cx)
+                            .language(*lang)
+                            .line_number(true)
+                            .soft_wrap(wrap.1)
+                            .searchable(true)
+                    }),
+                )
+            })
+            .collect();
+
+        // 任何会改变 draft() 的用户操作都经 mark_dirty（置脏 + 去抖写草稿）
+        let mut subs = vec![
+            cx.subscribe_in(&url, window, Self::on_url_event),
+            cx.subscribe_in(
+                &method,
+                window,
+                |this, _, _: &SelectEvent<Vec<&'static str>>, _, cx| this.mark_dirty(cx),
+            ),
+            cx.subscribe_in(&path_params, window, |this, _, _: &KvTableEvent, _, cx| {
+                this.mark_dirty(cx)
+            }),
+            cx.subscribe_in(&params, window, |this, _, _: &KvTableEvent, _, cx| {
+                this.mark_dirty(cx)
+            }),
+            // Headers 改动可能新增 / 删除 Content-Type，form-data 的冲突提示要跟着重算
+            cx.subscribe_in(&headers, window, |this, _, _: &KvTableEvent, _, cx| {
+                this.refresh_body_hint(cx);
+                this.mark_dirty(cx)
+            }),
+            cx.subscribe_in(&form, window, |this, _, _: &KvTableEvent, _, cx| {
+                this.mark_dirty(cx)
+            }),
+            cx.subscribe_in(&form_data, window, |this, _, _: &KvTableEvent, _, cx| {
+                this.mark_dirty(cx)
+            }),
+            cx.subscribe_in(&pre_ops, window, |this, _, _: &OpsTableEvent, _, cx| {
+                this.mark_dirty(cx)
+            }),
+            cx.subscribe_in(&post_ops, window, |this, _, _: &OpsTableEvent, _, cx| {
+                this.mark_dirty(cx)
+            }),
+        ];
+        for (_, editor) in &body_editors {
+            subs.push(cx.subscribe_in(editor, window, Self::on_body_editor_event));
+        }
+        // 占位符驻留在 InputState 里，切换界面语言时要自己刷新
+        subs.push(cx.observe_global_in::<Locale>(window, |this, window, cx| {
+            this.url.update(cx, |state, cx| {
+                state.set_placeholder(tr!("url_bar.placeholder"), window, cx)
+            });
+        }));
+        // body 编辑器内的 ⌘⏎ 由全局 SendRequest 动作处理（见 main.rs 的 bind_keys），不在此订阅
+
+        Self {
+            id,
+            saved_id: None,
+            saved_name: None,
+            saved_group: None,
+            dirty: false,
+            method,
+            url,
+            prepare_error: None,
+            unresolved_vars: BTreeSet::new(),
+            pre_ops,
+            post_ops,
+            pre_results: Vec::new(),
+            sent_post_ops: Vec::new(),
+            path_params,
+            params,
+            headers,
+            form,
+            form_data,
+            body_mode: BodyMode::None,
+            raw_format: RawFormat::Json,
+            http_version: HttpVersionPref::default(),
+            file_path: None,
+            file_size: None,
+            body_hint: None,
+            body_editors,
+            response_editors,
+            applied_wrap: wrap,
+            request_section: RequestSection::Params,
+            response_section: ResponseSection::Body,
+            pretty: true,
+            sse_mode: SseBodyMode::Text,
+            split: SplitDirection::Vertical,
+            body_scroll: UniformListScrollHandle::new(),
+            // 行数在响应到达时 reset；overdraw 预渲染视口外一小段，滚动不闪
+            headers_list: ListState::new(0, ListAlignment::Top, px(256.)),
+            lines_selection: LinesSelection::new(window, cx),
+            response: ResponseState::Idle,
+            notice: None,
+            generation: 0,
+            draft_save: None,
+            _subs: subs,
+        }
+    }
+
+    pub(crate) fn on_url_event(
+        &mut self,
+        _: &Entity<InputState>,
+        ev: &InputEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match ev {
+            InputEvent::Change => {
+                let names = extract_path_params(&self.url.read(cx).value());
+                self.path_params
+                    .update(cx, |t, cx| t.sync_keys(&names, window, cx));
+                // 上一次发送的校验错误与未定义变量提示都描述旧 URL，一起清掉
+                self.prepare_error = None;
+                self.unresolved_vars.clear();
+                self.mark_dirty(cx);
+            }
+            InputEvent::PressEnter { .. } => self.send(window, cx),
+            _ => {}
+        }
+    }
+
+    /// 文本 Body 编辑器内容变化：按 rope 的字节数（O(1)）判断是否提示改用文件 Body。
+    pub(crate) fn on_body_editor_event(
+        &mut self,
+        editor: &Entity<EditorState>,
+        ev: &InputEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !matches!(ev, InputEvent::Change) {
+            return;
+        }
+        // 三个格式各一个编辑器，只看当前格式的那个
+        if editor != self.editor_for(self.raw_format) {
+            return;
+        }
+        self.refresh_body_hint(cx);
+        self.mark_dirty(cx);
+    }
+
+    /// 按当前 body_mode 重新计算 Body 区的非阻塞提示（raw 的超大文本提示、form-data 的
+    /// Content-Type 冲突提示共用 `body_hint`）：不在这两个模式时清空。
+    /// 切换 raw_format / body_mode、以及 Headers 改动后都要调用，否则会残留上一个模式的提示，
+    /// 或者漏掉一个通过 `set_value`（不发 Change 事件）灌入内容的编辑器。
+    pub(crate) fn refresh_body_hint(&mut self, cx: &mut Context<Self>) {
+        let hint = match self.body_mode {
+            BodyMode::Raw => body_hint_for(self.editor_for(self.raw_format).read(cx).text().len()),
+            BodyMode::FormData if self.has_user_content_type(cx) => {
+                Some(BodyHint::FormDataContentType)
+            }
+            _ => None,
+        };
+        if hint != self.body_hint {
+            self.body_hint = hint;
+            cx.notify();
+        }
+    }
+
+    /// Headers 里是否有启用的 Content-Type（form-data 发送时会被剔除）。
+    fn has_user_content_type(&self, cx: &App) -> bool {
+        self.headers
+            .read(cx)
+            .values(cx)
+            .iter()
+            .any(|h| h.enabled && h.key.trim().eq_ignore_ascii_case("content-type"))
+    }
+
+    /// "选择文件"：系统打开对话框 → 后台读 metadata → 切到 file 模式。
+    pub fn choose_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some(tr!("common.choose")),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(paths))) = rx.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            let size = cx
+                .background_spawn({
+                    let path = path.clone();
+                    async move { std::fs::metadata(&path).map(|m| m.len()).ok() }
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.file_path = Some(path);
+                this.file_size = size;
+                this.body_mode = BodyMode::Binary;
+                this.mark_dirty(cx);
+            });
+        })
+        .detach();
+    }
+
+    pub fn clear_file(&mut self, cx: &mut Context<Self>) {
+        // body_mode 保持 Binary 不变：清除只是"未选文件"，draft() 据此报告"未选择文件"，
+        // 而不是悄悄退回 none/raw 让用户以为 Body 被清空了。
+        self.file_path = None;
+        self.file_size = None;
+        self.mark_dirty(cx);
+    }
+
+    pub fn focus_url(&self, window: &mut Window, cx: &mut Context<Self>) {
+        self.url.update(cx, |s, cx| s.focus(window, cx));
+    }
+
+    pub fn current_method(&self, cx: &App) -> Method {
+        self.method
+            .read(cx)
+            .selected_value()
+            .and_then(|s| Method::parse(s))
+            .unwrap_or(Method::Get)
+    }
+
+    pub fn editor_for(&self, format: RawFormat) -> &Entity<EditorState> {
+        &self
+            .body_editors
+            .iter()
+            .find(|(f, _)| *f == format)
+            .expect("editor per format")
+            .1
+    }
+
+    pub fn response_editor_for(&self, language: &str) -> &Entity<EditorState> {
+        &self
+            .response_editors
+            .iter()
+            .find(|(l, _)| *l == language)
+            .unwrap_or(&self.response_editors[2])
+            .1
+    }
+
+    pub fn has_path_params(&self, cx: &App) -> bool {
+        !extract_path_params(&self.url.read(cx).value()).is_empty()
+    }
+
+    /// 从各输入组件快照出纯数据的 RequestDraft。
+    pub fn draft(&self, cx: &App) -> RequestDraft {
+        let body = match self.body_mode {
+            BodyMode::None => BodyKind::None,
+            BodyMode::Raw => BodyKind::Raw {
+                format: self.raw_format,
+                text: self.editor_for(self.raw_format).read(cx).text().to_string(),
+            },
+            BodyMode::FormData => BodyKind::FormData {
+                fields: self.form_data.read(cx).form_fields(cx),
+            },
+            BodyMode::FormUrlEncoded => BodyKind::FormUrlEncoded {
+                fields: self.form.read(cx).values(cx),
+            },
+            BodyMode::Binary => BodyKind::Binary {
+                path: self.file_path.clone().unwrap_or_default(),
+                content_type: self
+                    .file_path
+                    .as_deref()
+                    .map(|p| guess_content_type(p).to_string()),
+            },
+        };
+        RequestDraft {
+            method: self.current_method(cx),
+            url: self.url.read(cx).value().to_string(),
+            path_params: self.path_params.read(cx).values(cx),
+            params: self.params.read(cx).values(cx),
+            headers: self.headers.read(cx).values(cx),
+            body,
+            pre_ops: self.pre_ops.read(cx).pre_ops(cx),
+            post_ops: self.post_ops.read(cx).post_ops(cx),
+        }
+    }
+
+    /// Tab 标题：已保存请求名优先，否则取 URL 末段（spec §7.1）。
+    pub fn title(&self, cx: &App) -> SharedString {
+        self.saved_name
+            .clone()
+            .unwrap_or_else(|| tab_title(&self.url.read(cx).value()))
+    }
+
+    pub fn set_pretty(&mut self, pretty: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pretty == pretty {
+            return;
+        }
+        self.pretty = pretty;
+        self.sync_response_editor(window, cx);
+        self.sync_lines_selection(window, cx);
+    }
+
+    /// 切换 SSE Body 区的视图（文本 / 事件流 / 原始）。
+    pub fn set_sse_mode(&mut self, mode: SseBodyMode, window: &mut Window, cx: &mut Context<Self>) {
+        if self.sse_mode == mode {
+            return;
+        }
+        self.sse_mode = mode;
+        self.sync_response_editor(window, cx);
+        self.sync_lines_selection(window, cx);
+    }
+
+    /// 当前应生效的 SSE 视图：选了"文本"但流里拼不出文本时回落到"事件流"。
+    pub fn effective_sse_mode(&self, sse: &crate::state::response::SseView) -> SseBodyMode {
+        if self.sse_mode == SseBodyMode::Text && sse.text.is_none() {
+            SseBodyMode::Events
+        } else {
+            self.sse_mode
+        }
+    }
+
+    /// Body 区当前应显示的文档：SSE 响应按 `sse_mode` 选（Events 是列表、没有文档），
+    /// 普通响应按 Pretty/Raw 选。
+    pub fn current_doc<'a>(
+        &self,
+        view: &'a ResponseView,
+    ) -> Option<&'a crate::state::response::PreparedDoc> {
+        match &view.sse {
+            Some(sse) => match self.effective_sse_mode(sse) {
+                SseBodyMode::Text => sse.text.as_ref(),
+                SseBodyMode::Raw => view.raw.as_ref(),
+                SseBodyMode::Events => None,
+            },
+            None => view.doc(self.pretty),
+        }
+    }
+
+    /// Pretty/Raw 或 SSE 视图切换后，把新选中的文档写回只读编辑器（仅 A 档需要）。
+    fn sync_response_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let ResponseState::Done { view, .. } = &self.response
+            && let Some(doc) = self.current_doc(view)
+            && doc.tier == ViewTier::Editor
+        {
+            let text = doc.shared_text();
+            let editor = self
+                .response_editor_for(view.kind.editor_language())
+                .clone();
+            editor.update(cx, |e, cx| e.set_value(text, window, cx));
+        }
+        self.body_scroll.scroll_to_item(0, ScrollStrategy::Top);
+        cx.notify();
+    }
+
+    /// 把 raw JSON 请求体重新缩进。非法 JSON 不动内容，只在编辑器下方给一行提示。
+    ///
+    /// 用 core 自己的 `pretty_json` 而不是 serde：它是单遍字节流实现，不解析成 `Value`，
+    /// 所以**不会把对象的 key 按字母序重排**——请求体的字段顺序是用户写的，不能动。
+    pub fn format_body(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.body_mode != BodyMode::Raw || self.raw_format != RawFormat::Json {
+            return;
+        }
+        let editor = self.editor_for(RawFormat::Json).clone();
+        let text = editor.read(cx).text().to_string();
+        // 空请求体：什么也不做，别拿「不是合法 JSON」去烦用户
+        if text.trim().is_empty() {
+            return;
+        }
+        if !is_valid_json(text.as_bytes()) {
+            self.body_hint = Some(BodyHint::InvalidJson);
+            cx.notify();
+            return;
+        }
+        let formatted = String::from_utf8_lossy(&pretty_json(text.as_bytes())).into_owned();
+        // 已经是格式化好的：不产生一次无意义的脏标记
+        if formatted == text {
+            return;
+        }
+        // replace_all 保留 undo 历史（一次 ⌘Z 撤销整个格式化），并且会发 Change 事件，
+        // 于是 on_body_editor_event 会接着做 refresh_body_hint + mark_dirty
+        editor.update(cx, |e, cx| e.replace_all(formatted, window, cx));
+    }
+
+    /// 用户改动的唯一入口：置脏、重绘、去抖写草稿。
+    pub(crate) fn mark_dirty(&mut self, cx: &mut Context<Self>) {
+        self.dirty = true;
+        self.schedule_draft_save(cx);
+        cx.notify();
+    }
+
+    /// 保存成功后调用。
+    pub(crate) fn mark_clean(&mut self, cx: &mut Context<Self>) {
+        self.dirty = false;
+        cx.notify();
+    }
+
+    fn schedule_draft_save(&mut self, cx: &mut Context<Self>) {
+        if store(cx).is_none() {
+            return;
+        }
+        // 替换旧任务即取消旧计时器
+        self.draft_save = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(DRAFT_DEBOUNCE).await;
+            let _ = this.update(cx, |this, cx| this.save_draft_now(cx));
+        }));
+    }
+
+    /// 立即投递一份草稿快照（跳过去抖）；序列化在写入线程完成。
+    pub(crate) fn save_draft_now(&mut self, cx: &mut Context<Self>) {
+        self.draft_save = None;
+        if let Some(store) = store(cx) {
+            store.write_draft(self.tab_draft(cx));
+        }
+    }
+
+    /// 草稿文件的内容：draft 快照 + 来源 + 是否有改动。
+    pub fn tab_draft(&self, cx: &App) -> TabDraft {
+        TabDraft {
+            id: self.id,
+            draft: self.draft(cx),
+            saved_id: self.saved_id,
+            dirty: self.dirty,
+        }
+    }
+
+    /// 用一份 RequestDraft 重建所有输入组件（恢复草稿 / 打开已保存请求）。
+    /// 只走不发事件的程序化写入，因此不会置脏；`saved_id` / `saved_name` / `dirty` 由调用方设置。
+    pub fn load_draft(
+        &mut self,
+        draft: &RequestDraft,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.method.update(cx, |s, cx| {
+            s.set_selected_value(&draft.method.as_str(), window, cx)
+        });
+        self.url
+            .update(cx, |u, cx| u.set_value(draft.url.clone(), window, cx));
+        self.path_params
+            .update(cx, |t, cx| t.set_values(&draft.path_params, window, cx));
+        self.params
+            .update(cx, |t, cx| t.set_values(&draft.params, window, cx));
+        self.headers
+            .update(cx, |t, cx| t.set_values(&draft.headers, window, cx));
+        self.file_path = None;
+        self.file_size = None;
+        match &draft.body {
+            BodyKind::None => self.body_mode = BodyMode::None,
+            BodyKind::Raw { format, text } => {
+                self.body_mode = BodyMode::Raw;
+                self.raw_format = *format;
+                let editor = self.editor_for(*format).clone();
+                editor.update(cx, |e, cx| e.set_value(text.clone(), window, cx));
+            }
+            BodyKind::FormData { fields } => {
+                self.body_mode = BodyMode::FormData;
+                self.form_data
+                    .update(cx, |t, cx| t.set_form_fields(fields, window, cx));
+            }
+            BodyKind::FormUrlEncoded { fields } => {
+                self.body_mode = BodyMode::FormUrlEncoded;
+                self.form
+                    .update(cx, |t, cx| t.set_values(fields, window, cx));
+            }
+            BodyKind::Binary { path, .. } => {
+                self.body_mode = BodyMode::Binary;
+                if !path.as_os_str().is_empty() {
+                    self.file_path = Some(path.clone());
+                    self.refresh_file_size(cx);
+                }
+            }
+        }
+        self.pre_ops
+            .update(cx, |t, cx| t.set_pre_ops(&draft.pre_ops, window, cx));
+        self.post_ops
+            .update(cx, |t, cx| t.set_post_ops(&draft.post_ops, window, cx));
+        self.prepare_error = None;
+        self.unresolved_vars.clear();
+        self.refresh_body_hint(cx);
+        cx.notify();
+    }
+
+    /// 后台读取文件 Body 的大小（只用于显示）。
+    fn refresh_file_size(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.file_path.clone() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let size = cx
+                .background_spawn(async move { std::fs::metadata(&path).map(|m| m.len()).ok() })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.file_size = size;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+}
+
+impl RequestTab {
+    pub fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // 在途请求期间按钮显示"取消"，此时 ⌘⏎ / Enter 不应重复发送。
+        if self.response.is_in_flight() {
+            return;
+        }
+        // 前置操作在变量表副本上执行，再按副本替换（按值交出 draft() 刚拷出来的快照，
+        // 替换后直接复用，不再多克隆一次 body）
+        let prepared = variables::prepare_send(cx, self.saved_group.as_deref(), self.draft(cx));
+        self.unresolved_vars = prepared.resolved.unresolved;
+        let mut draft = prepared.resolved.draft;
+        let req = match http::prepare(&draft) {
+            Ok(r) => r,
+            Err(e) => {
+                // 请求发不出去：丢掉副本，前置操作的写入不进全局、不落盘（反复点发送也不会反复写）
+                self.pre_results.clear();
+                self.sent_post_ops.clear();
+                self.prepare_error = Some(e);
+                cx.notify();
+                return;
+            }
+        };
+        // 请求确定会发出：提交前置操作的写入（值没变时 update 不写盘）
+        if let Some(next) = prepared.next {
+            variables::update(cx, |sets| *sets = next);
+        }
+        self.pre_results = prepared.pre_results;
+        // 断言的期望值在上面已经替换完：一份随完成任务进后台执行，一份留给请求失败时标记「未执行」
+        let post_ops: Vec<PostOp> = std::mem::take(&mut draft.post_ops);
+        self.sent_post_ops = post_ops.clone();
+        self.prepare_error = None;
+        self.notice = None;
+        self.generation += 1;
+        let generation = self.generation;
+
+        let (tx, mut rx) = mpsc::channel::<http::StreamEvent>(64);
+        let request_task = bridge::send(cx, req, self.http_version, tx);
+
+        // 进度任务：把 tokio 侧的流事件写回 Entity。进度已节流到 ≤ 30 Hz；
+        // SSE 的 body 分片逐块到达，在这里增量解析——这就是"收到就展示"的入口。
+        let progress_task = cx.spawn_in(window, async move |this, cx| {
+            while let Some(ev) = rx.recv().await {
+                let keep_going = this
+                    .update(cx, |this, cx| {
+                        if this.generation != generation {
+                            return false;
+                        }
+                        let ResponseState::InFlight {
+                            started,
+                            received,
+                            total,
+                            live,
+                            ..
+                        } = &mut this.response
+                        else {
+                            return true;
+                        };
+                        match ev {
+                            http::StreamEvent::Head { content_type, .. } => {
+                                if germal_core::sse::is_sse(content_type.as_deref()) {
+                                    *live = Some(SseLive::default());
+                                }
+                            }
+                            http::StreamEvent::Chunk(chunk) => {
+                                if let Some(live) = live {
+                                    let elapsed = started.elapsed();
+                                    live.push(&chunk, elapsed);
+                                    cx.notify();
+                                }
+                            }
+                            http::StreamEvent::Progress(p) => {
+                                *received = p.received;
+                                *total = p.total;
+                                cx.notify();
+                            }
+                        }
+                        true
+                    })
+                    .unwrap_or(false);
+                if !keep_going {
+                    break;
+                }
+            }
+        });
+
+        // 计时任务：每 TICK_INTERVAL 触发一次重绘，让状态行的耗时实时更新；generation 变化即退出。
+        let tick_task = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(TICK_INTERVAL).await;
+                let keep_going = this
+                    .update(cx, |this, cx| {
+                        if this.generation != generation {
+                            return false;
+                        }
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(false);
+                if !keep_going {
+                    break;
+                }
+            }
+        });
+
+        // 后台准备阶段的取消旗标：随 InFlight 一起 drop 即置位
+        let cancel = CancelFlag::new();
+        let cancelled = cancel.handle();
+
+        // 完成任务：等待请求 → 后台准备视图（可取消）→ 回主线程写入（generation 不匹配则丢弃）。
+        let completion_task = cx.spawn_in(window, async move |this, cx| {
+            let outcome: Result<HttpResponse, RequestError> = match request_task.await {
+                Ok(inner) => inner,
+                Err(e) => Err(RequestError::Other(e.to_string())),
+            };
+            let prepared = match outcome {
+                Ok(HttpResponse { meta, body }) => {
+                    // prepare_guarded 把后台 panic 转成 Err（spec §11），取消仍是 None
+                    let guarded = cx
+                        .background_spawn(async move {
+                            prepare_guarded(meta, body, post_ops, || {
+                                cancelled.load(Ordering::Relaxed)
+                            })
+                        })
+                        .await;
+                    match guarded {
+                        Some(result) => result,
+                        // 已取消：不回写任何东西
+                        None => return,
+                    }
+                }
+                Err(e) => Err(e),
+            };
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.apply_outcome(generation, prepared, window, cx)
+            });
+        });
+
+        self.response = ResponseState::InFlight {
+            started: Instant::now(),
+            received: 0,
+            total: None,
+            live: None,
+            _tasks: vec![progress_task, tick_task, completion_task],
+            _cancel: cancel,
+        };
+        cx.notify();
+    }
+
+    /// 请求结果的唯一写入口（取消由 `cancel()` 直接写 Failed）：
+    /// generation 不匹配（已取消或已重发）则直接丢弃，过期响应不得覆盖新状态。
+    pub(crate) fn apply_outcome(
+        &mut self,
+        generation: u64,
+        outcome: Result<Prepared, RequestError>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.generation != generation {
+            return;
+        }
+        // 本次发送的前置结果与后置快照：无论成败都在这里取走
+        let pre = std::mem::take(&mut self.pre_results);
+        let sent_post_ops = std::mem::take(&mut self.sent_post_ops);
+        match outcome {
+            Ok((body, mut view, report)) => {
+                // TTFT（首个内容 delta 的时刻）只有在途解析才知道：从被替换掉的
+                // InFlight 状态里合并进 Done 视图。
+                if let Some(sse) = view.sse.as_mut()
+                    && let ResponseState::InFlight {
+                        live: Some(live), ..
+                    } = &self.response
+                {
+                    sse.first_delta = live.first_delta;
+                }
+                // A 档：整段文本写入对应语言的只读编辑器；B/C 档由虚拟列表直接切片，不经过编辑器
+                if let Some(doc) = self.current_doc(&view)
+                    && doc.tier == ViewTier::Editor
+                {
+                    let editor = self
+                        .response_editor_for(view.kind.editor_language())
+                        .clone();
+                    editor.update(cx, |e, cx| e.set_value(doc.shared_text(), window, cx));
+                }
+                self.body_scroll.scroll_to_item(0, ScrollStrategy::Top);
+                // reset 让列表按新响应的行数重建，滚动位置一并回到顶部
+                self.headers_list.reset(view.header_rows.len());
+                let mut report = report;
+                if let Some(report) = report.as_mut() {
+                    // generation 已在函数开头校验：过期回调不会走到这里，提取值也就不会写盘。
+                    // 必须在组装 OpsReport 之前调：写不进去的提取行在这里才被改写为「跳过」。
+                    // 分类取响应到达时的 saved_group 是有意的：分类改名 / 解散会同步 Tab 的
+                    // saved_group，发送时的旧名可能已经不存在了
+                    variables::apply_extracted(cx, self.saved_group.as_deref(), report);
+                }
+                let ops = (!pre.is_empty() || report.is_some()).then(|| OpsReport {
+                    pre,
+                    post: report.unwrap_or_default(),
+                });
+                self.response = ResponseState::Done { body, view, ops };
+                self.response_section = ResponseSection::Body;
+                self.sync_lines_selection(window, cx);
+            }
+            Err(error) => {
+                // 取消是用户主动放弃，结果丢弃；其余失败（网络错误、后台处理异常）保留前置结果
+                // （写入已在发送时提交），后置操作一律记为「请求失败，未执行」（spec 前后置操作 · 限制）
+                let ops = if matches!(error, RequestError::Cancelled) {
+                    None
+                } else {
+                    let post = ops::skip_all(&sent_post_ops);
+                    (!pre.is_empty() || !post.results.is_empty()).then_some(OpsReport { pre, post })
+                };
+                self.response = ResponseState::Failed { error, ops };
+            }
+        }
+        cx.notify();
+    }
+
+    /// 取消进行中的请求：递增 generation 让在途任务的回调失效，drop 掉任务本身，状态显示"已取消"。
+    pub fn cancel(&mut self, cx: &mut Context<Self>) {
+        if !self.response.is_in_flight() {
+            return;
+        }
+        self.generation += 1;
+        self.pre_results.clear();
+        self.sent_post_ops.clear();
+        // 取消是用户主动放弃：前后置结果一并丢弃（spec 前后置操作 · 限制）
+        self.response = ResponseState::Failed {
+            error: RequestError::Cancelled,
+            ops: None,
+        };
+        cx.notify();
+    }
+
+    /// 清空响应：整块回到「未发送」，不只是抹掉正文。
+    ///
+    /// 目的是**释放**——大响应的 `BodyStore` 可能是 `Spilled`，换掉 `response` 才会 drop
+    /// 掉 `SpillFile`、把临时文件删干净。也正因如此这一步不可逆，但响应重发即可拿回，
+    /// 所以不弹确认框。
+    pub fn clear_response(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.lines_selection.set_doc(None, window, cx);
+        if matches!(self.response, ResponseState::Idle) {
+            return;
+        }
+        // 必须先自增：在途的进度 / 完成回调靠 generation 判断自己是否过期（见 apply_outcome），
+        // 先把号改掉，换 response 时被 drop 的任务就再也写不回来了
+        self.generation += 1;
+        self.response = ResponseState::Idle;
+        // 在途请求的前置结果与后置快照随它一起作废（完成回调已因 generation 失效，不会再来取）
+        self.pre_results.clear();
+        self.sent_post_ops.clear();
+        // 编辑器是常驻实体，不随 response 一起 drop。留着上一条响应的文本，
+        // 下一条非 A 档响应到来时 apply_outcome 不会覆写它，残留内容会在 ⌘F 里冒出来
+        for (_, editor) in &self.response_editors {
+            editor.update(cx, |e, cx| e.set_value("", window, cx));
+        }
+        self.notice = None;
+        // 未解析变量提示挂在这次响应上（发送时算的），响应被清空后一起清掉
+        self.unresolved_vars.clear();
+        // 「证书」页签在 Idle 下不再出现，停在那一页会落到空态分支
+        self.response_section = ResponseSection::Body;
+        self.body_scroll.scroll_to_item(0, ScrollStrategy::Top);
+        self.headers_list.reset(0);
+        cx.notify();
+    }
+
+    /// ⌘F / 工具栏搜索按钮：A 档把焦点交给只读编辑器并打开它的搜索面板；B / C 档没有编辑器，只提示。
+    pub fn find_in_response(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let ResponseState::Done { view, .. } = &self.response else {
+            self.notice = Some(Notice::NoResponse);
+            cx.notify();
+            return;
+        };
+        // SSE 的事件列表视图与 B/C 档一样没有编辑器可搜
+        if view.sse.is_some() && self.current_doc(view).is_none() {
+            self.notice = Some(Notice::SseEventsSearch);
+            cx.notify();
+            return;
+        }
+        let Some(doc) = self.current_doc(view) else {
+            self.notice = Some(Notice::BinarySearch);
+            cx.notify();
+            return;
+        };
+        if doc.tier != ViewTier::Editor {
+            self.notice = Some(Notice::VirtualSearch);
+            cx.notify();
+            return;
+        }
+        if doc.doc.line_count() == 0 {
+            self.notice = Some(Notice::EmptyBodySearch);
+            cx.notify();
+            return;
+        }
+        let editor = self
+            .response_editor_for(view.kind.editor_language())
+            .clone();
+        let switched = self.response_section != ResponseSection::Body;
+        self.response_section = ResponseSection::Body;
+        self.notice = None;
+        // 立即聚焦：调用返回时焦点就该在编辑器上（"已在 Body"路径紧接着就要 `dispatch_action`，
+        // 切换路径也靠这一次让状态同步可见）。切换路径下面还会再聚焦一次，两次各有各的必要：
+        // 这一帧编辑器还没进分发树，`window.draw` 会把不在树里的焦点丢掉。
+        editor.update(cx, |e, cx| e.focus(window, cx));
+        if switched {
+            // `dispatch_action` 按「上一帧渲染出的分发树」找焦点节点，而刚从 Headers 切回 Body 时编辑器这一帧才出现。
+            // gpui 的帧处理把 `pending_next_frame_callbacks` 跑在 `window.draw` 之前
+            // （zed e0931d5 `crates/gpui/src/window.rs:1592-1621`），所以第一层 `on_next_frame` 里 `rendered_frame`
+            // 仍是 Headers 那一帧，派发会退回根节点被丢弃；要再嵌一层，等 Body 真的画出来之后再聚焦并派发。
+            window.on_next_frame(move |window, _| {
+                window.on_next_frame(move |window, cx| {
+                    editor.update(cx, |e, cx| e.focus(window, cx));
+                    window.dispatch_action(Box::new(Search), cx);
+                });
+            });
+        } else {
+            window.dispatch_action(Box::new(Search), cx);
+        }
+        cx.notify();
+    }
+
+    /// "保存到文件"：弹系统保存对话框（从上次保存的目录打开），选中后在 tokio 上原子写入 / 拷贝，
+    /// 完成后在工具栏显示结果并记住目录。
+    pub fn save_body(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let ResponseState::Done { body, view, .. } = &self.response else {
+            return;
+        };
+        let body = body.clone();
+        let suggested = format!("response.{}", file_extension(view.kind));
+        let generation = self.generation;
+        let dir = save_dialog_dir(cx);
+        let rx = cx.prompt_for_new_path(&dir, Some(suggested.as_str()));
+        cx.spawn_in(window, async move |this, cx| {
+            // 对话框取消 / 出错都静默返回
+            let Ok(Ok(Some(dest))) = rx.await else {
+                return;
+            };
+            let result = match cx.update(|_, cx| bridge::save_body(cx, body, dest.clone())) {
+                Ok(task) => task.await,
+                Err(e) => Err(e),
+            };
+            let _ = this.update(cx, |this, cx| {
+                if result.is_ok() {
+                    cx.set_global(LastSaveDir(dest.parent().map(Path::to_path_buf)));
+                }
+                // 已重发：不再展示旧响应的保存结果
+                if this.generation != generation {
+                    return;
+                }
+                this.notice = Some(match result {
+                    Ok(()) => Notice::SavedTo(dest),
+                    Err(e) => Notice::SaveFailed(e.to_string()),
+                });
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// "用系统程序打开"：只有落盘响应才有文件可开。
+    pub fn open_body_with_system(&self, cx: &mut Context<Self>) {
+        if let ResponseState::Done { body, .. } = &self.response
+            && let Some(path) = body.path()
+        {
+            cx.open_with_system(path);
+        }
+    }
+
+    /// 把全局换行偏好补到本 Tab 的编辑器上；由 `render` 每帧调用，值没变时是空操作。
+    ///
+    /// 走「render 时比对」而不是「改设置时广播」：`set_soft_wrap` 需要 `Window`，
+    /// 而 `settings::update` 只拿得到 `App`。在自己的 `render` 里 update 子实体不会
+    /// 触发 gpui 的重入 panic——被借的是 `EditorState`，不是 `RequestTab` 自己。
+    fn sync_body_wrap(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let wanted = wrap_prefs(cx);
+        if wanted == self.applied_wrap {
+            return;
+        }
+        if wanted.0 != self.applied_wrap.0 {
+            for (_, editor) in &self.body_editors {
+                editor.update(cx, |e, cx| e.set_soft_wrap(wanted.0, window, cx));
+            }
+        }
+        if wanted.1 != self.applied_wrap.1 {
+            for (_, editor) in &self.response_editors {
+                editor.update(cx, |e, cx| e.set_soft_wrap(wanted.1, window, cx));
+            }
+        }
+        self.applied_wrap = wanted;
+    }
+
+    /// 测试用：已套用到编辑器上的换行开关 `(请求体, 响应体)`。
+    #[cfg(test)]
+    pub fn applied_wrap(&self) -> (bool, bool) {
+        self.applied_wrap
+    }
+
+    /// 请求体「自动换行」开关。偏好是全局的，落 `settings.json`。
+    pub fn toggle_request_wrap(&mut self, cx: &mut Context<Self>) {
+        settings::update(cx, |s| s.wrap_request_body = !s.wrap_request_body);
+        cx.notify();
+    }
+
+    /// 响应体「自动换行」开关。只对 A 档（只读 Editor）有意义，B/C 档按行虚拟化，
+    /// 调用点负责在那两档下禁用按钮。
+    /// 顶栏"复制"按钮当前会复制什么（渲染时只判断有无，不真拼文本——响应体可能有几十 MB）。
+    pub fn copy_target(&self) -> Option<CopyTarget> {
+        let ResponseState::Done { view, .. } = &self.response else {
+            return None;
+        };
+        match self.response_section {
+            ResponseSection::Body => self.current_doc(view).map(|d| {
+                if d.tier == ViewTier::Preview {
+                    CopyTarget::BodyPreview
+                } else {
+                    CopyTarget::Body
+                }
+            }),
+            ResponseSection::Headers => Some(CopyTarget::Headers),
+            ResponseSection::Certificate | ResponseSection::Ops => None,
+        }
+    }
+
+    /// 顶栏"复制"按钮要复制的文本：Body 页是当前显示的文档（Pretty / Raw、SSE 的文本 / 原始视图；
+    /// 落盘响应只有内存里的预览部分），Headers 页是全部响应头（每行 `Name: value`），证书页没有。
+    pub fn copy_target_text(&self) -> Option<String> {
+        let ResponseState::Done { view, .. } = &self.response else {
+            return None;
+        };
+        match self.copy_target()? {
+            CopyTarget::Body | CopyTarget::BodyPreview => {
+                self.current_doc(view).map(|d| d.doc.text().to_string())
+            }
+            CopyTarget::Headers => Some(
+                view.header_rows
+                    .iter()
+                    .map(|(name, value)| format!("{name}: {value}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+        }
+    }
+
+    /// ⌘A 落在 B/C 档行视图上：整份响应体进入选中态，⌘C 复制全文。
+    pub fn select_all_response_lines(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.lines_selection.select_all(window, cx);
+    }
+
+    /// 让选择参与者知道 B/C 档当前显示的是哪份文档（A 档走只读编辑器，不归它管）；
+    /// 文档换了就清掉旧选区。响应到达、Pretty/Raw 与 SSE 视图切换、清空响应后都要调一次。
+    fn sync_lines_selection(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let doc = match &self.response {
+            ResponseState::Done { view, .. } => self
+                .current_doc(view)
+                .filter(|d| d.tier != ViewTier::Editor)
+                .map(|d| d.doc.clone()),
+            _ => None,
+        };
+        self.lines_selection.set_doc(doc, window, cx);
+    }
+
+    pub fn toggle_response_wrap(&mut self, cx: &mut Context<Self>) {
+        settings::update(cx, |s| s.wrap_response_body = !s.wrap_response_body);
+        cx.notify();
+    }
+
+    /// 当前响应上的前后置操作报告（Done 与 Failed 都可能有；Idle / InFlight / 取消没有）。
+    pub fn ops_report(&self) -> Option<&OpsReport> {
+        match &self.response {
+            ResponseState::Done { ops, .. } | ResponseState::Failed { ops, .. } => ops.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// 响应体当前这一档是否支持换行：只有 A 档的只读 Editor 支持。
+    /// B/C 档走 `uniform_list`，它要求所有行等高，换行会直接打破这个前提。
+    pub fn response_wrap_available(&self) -> bool {
+        match &self.response {
+            ResponseState::Done { view, .. } => self
+                .current_doc(view)
+                .is_some_and(|d| d.tier == ViewTier::Editor),
+            _ => false,
+        }
+    }
+}
+
+impl Render for RequestTab {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 换行是全局偏好，但只有这里同时拿得到 `Window` 与所有编辑器实体
+        self.sync_body_wrap(window, cx);
+        // 两个方向各用一个 id：ResizablePanelGroup 按 id 记住拖出来的尺寸，上下与左右互不串扰
+        let group = match self.split {
+            SplitDirection::Vertical => v_resizable("request-response-v"),
+            SplitDirection::Horizontal => h_resizable("request-response-h"),
+        };
+        // 请求 / 响应默认各占一半：两块面板都不给初始像素尺寸，而是把 flex-basis 压到 0，
+        // 剩余空间由同为 flex-grow 1 的两者均分（basis 留 auto 时会按内容宽度分，不均）。
+        // 首帧量到的尺寸会被 ResizableState 记下，之后拖动与等比缩放照旧。
+        let half = || {
+            resizable_panel()
+                .flex_basis(px(0.))
+                .size_range(px(140.)..px(4000.))
+        };
+        v_flex().size_full().child(self.render_url_bar(cx)).child(
+            div().flex_1().min_h_0().min_w_0().child(
+                group
+                    .child(half().child(self.render_request_pane(cx)))
+                    .child(half().child(self.render_response_pane(window, cx))),
+            ),
+        )
+    }
+}
+
+/// 保存对话框的建议扩展名。
+fn file_extension(kind: ContentKind) -> &'static str {
+    match kind {
+        ContentKind::Json => "json",
+        ContentKind::Xml => "xml",
+        ContentKind::Html => "html",
+        ContentKind::Text => "txt",
+        ContentKind::Binary => "bin",
+    }
+}
+
+/// Tab 标题：有路径取路径，否则取主机名；空 URL 显示「新请求」。
+pub fn tab_title(url: &str) -> SharedString {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return tr!("tab.untitled");
+    }
+    // 先去 query 再去 scheme：`localhost:8080/cb?to=https://x` 的 `://` 在 query 里
+    let without_query = trimmed.split('?').next().unwrap_or(trimmed);
+    let without_scheme = without_query
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(without_query);
+    if without_scheme.is_empty() {
+        return tr!("tab.untitled");
+    }
+    match without_scheme.find('/') {
+        Some(ix) if ix + 1 < without_scheme.len() => without_scheme[ix..].to_string().into(),
+        Some(ix) => without_scheme[..ix].to_string().into(),
+        None => without_scheme.to_string().into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn body_hint_threshold() {
+        assert!(body_hint_for(0).is_none());
+        assert!(body_hint_for(BODY_HINT_BYTES).is_none());
+        assert!(
+            body_hint_for(BODY_HINT_BYTES + 1)
+                .unwrap()
+                .text()
+                .contains("10 MB")
+        );
+    }
+
+    #[test]
+    fn body_mode_round_trips_through_index() {
+        for (ix, mode) in BodyMode::ALL.iter().enumerate() {
+            assert_eq!(mode.index(), ix);
+            assert_eq!(BodyMode::from_index(ix), *mode);
+        }
+        assert_eq!(BodyMode::from_index(99), BodyMode::None);
+    }
+
+    #[test]
+    fn body_modes_follow_postman_order() {
+        assert_eq!(
+            BodyMode::ALL,
+            [
+                BodyMode::None,
+                BodyMode::FormData,
+                BodyMode::FormUrlEncoded,
+                BodyMode::Raw,
+                BodyMode::Binary
+            ]
+        );
+    }
+
+    #[test]
+    fn title_from_url() {
+        // 测试进程的 locale 是 en（见 i18n::locale_test_lock）
+        let _locale = crate::i18n::locale_test_lock();
+        assert_eq!(tab_title("").as_ref(), "New request");
+        assert_eq!(
+            tab_title("https://api.example.com/users/42?x=1").as_ref(),
+            "/users/42"
+        );
+        assert_eq!(
+            tab_title("https://api.example.com").as_ref(),
+            "api.example.com"
+        );
+        assert_eq!(tab_title("api.example.com/").as_ref(), "api.example.com");
+        assert_eq!(tab_title("not a url").as_ref(), "not a url");
+        assert_eq!(tab_title("https://").as_ref(), "New request");
+        assert_eq!(tab_title("http://").as_ref(), "New request");
+        // query 里的 "://" 不是 scheme
+        assert_eq!(tab_title("localhost:8080/cb?to=https://x").as_ref(), "/cb");
+        assert_eq!(tab_title("x.com?a=1").as_ref(), "x.com");
+    }
+}

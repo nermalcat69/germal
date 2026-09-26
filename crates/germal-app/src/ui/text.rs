@@ -1,0 +1,334 @@
+//! core 类型的界面文案：core 的 `Display` 是英文技术文案，界面上按变体翻译。
+//!
+//! 规则（与用户确认过）：错误的**种类**翻译，**技术细节**（reqwest 原话、路径、字段名）
+//! 两种语言都保留英文原文。
+
+use std::collections::BTreeSet;
+
+use germal_core::body::spill::HEAD_BYTES;
+use germal_core::body::tier::{EDITOR_MAX_BYTES, EDITOR_MAX_LINES, ViewTier, mib_label};
+use germal_core::detect::ContentKind;
+use germal_core::http::{MAX_BODY_BYTES, RequestError};
+use germal_core::model::{LanguagePref, ThemePref, UpdateSourcePref};
+use germal_core::ops::{OPS_JSON_MAX_BYTES, OpFailure, OpOutcome, OpSkip};
+use germal_core::postman_env::PostmanEnvError;
+use germal_core::tls::CertWarning;
+use gpui_kit::SharedString;
+
+use crate::i18n::tr;
+use crate::state::response::PREPARE_PANIC_PREFIX;
+
+/// 证书问题的短标签。这些是「哪里不对」的分类，按规则要翻译；
+/// 证书里的主体、颁发者等原文字段则原样展示。
+pub fn cert_warning_label(warning: CertWarning) -> SharedString {
+    match warning {
+        CertWarning::Expired => tr!("cert.warning.expired"),
+        CertWarning::NotYetValid => tr!("cert.warning.not_yet_valid"),
+        CertWarning::HostnameMismatch => tr!("cert.warning.hostname_mismatch"),
+        CertWarning::SelfSigned => tr!("cert.warning.self_signed"),
+    }
+}
+
+/// 错误种类的短标签（状态行、失败页标题）。
+pub fn error_kind(error: &RequestError) -> SharedString {
+    match error {
+        RequestError::InvalidUrl(_) => tr!("error.kind.invalid_url"),
+        RequestError::InvalidHeader(_) => tr!("error.kind.invalid_header"),
+        RequestError::Unsupported(_) => tr!("error.kind.unsupported"),
+        RequestError::Dns(_) => tr!("error.kind.dns"),
+        RequestError::ConnectionRefused(_) => tr!("error.kind.connection_refused"),
+        RequestError::Tls(_) => tr!("error.kind.tls"),
+        RequestError::Timeout => tr!("error.kind.timeout"),
+        RequestError::Spill(_) => tr!("error.kind.spill"),
+        RequestError::FileBody(_) => tr!("error.kind.file_body"),
+        RequestError::Cancelled => tr!("error.kind.cancelled"),
+        // 后台准备阶段 panic 被包成 Other（见 response::prepare_guarded）：不是网络问题，单独给标签
+        RequestError::Other(s) if s.starts_with(PREPARE_PANIC_PREFIX) => {
+            tr!("error.kind.background_failed")
+        }
+        RequestError::Other(_) => tr!("error.kind.other"),
+    }
+}
+
+/// 错误的说明：带载荷的变体直接给载荷（技术细节保留原文），其余给一句翻译。
+pub fn error_detail(error: &RequestError) -> SharedString {
+    match error {
+        RequestError::InvalidUrl(s)
+        | RequestError::InvalidHeader(s)
+        | RequestError::Unsupported(s)
+        | RequestError::Dns(s)
+        | RequestError::ConnectionRefused(s)
+        | RequestError::Tls(s)
+        | RequestError::Spill(s)
+        | RequestError::FileBody(s) => s.clone().into(),
+        RequestError::Other(s) => s
+            .strip_prefix(PREPARE_PANIC_PREFIX)
+            .map(|rest| rest.trim_start_matches([':', ' ']).to_string())
+            .unwrap_or_else(|| s.clone())
+            .into(),
+        RequestError::Timeout => tr!("error.detail.timeout"),
+        RequestError::Cancelled => tr!("error.kind.cancelled"),
+    }
+}
+
+/// 发送前校验失败的一行提示：种类 + 细节。
+pub fn prepare_error_line(error: &RequestError) -> SharedString {
+    let detail = error_detail(error);
+    if detail.is_empty() {
+        error_kind(error)
+    } else {
+        format!("{}: {}", error_kind(error), detail).into()
+    }
+}
+
+/// 未解析变量提示：「Undefined variables: a, b」。
+pub fn unresolved_vars_line(names: &BTreeSet<String>) -> SharedString {
+    let names_str = names.iter().cloned().collect::<Vec<_>>().join(", ");
+    tr!("url_bar.unresolved_vars", names = names_str)
+}
+
+/// 内容类型标签：JSON / XML / HTML 是专名不翻译，文本 / 二进制按语言显示。
+pub fn content_kind_label(kind: ContentKind) -> SharedString {
+    match kind {
+        ContentKind::Text => tr!("content.text"),
+        ContentKind::Binary => tr!("content.binary"),
+        other => other.label().into(),
+    }
+}
+
+/// 响应档位的横幅提示；A 档没有。数字全部来自 core 的阈值常量。
+pub fn tier_notice(tier: ViewTier) -> Option<SharedString> {
+    match tier {
+        ViewTier::Editor => None,
+        ViewTier::Virtual => Some(tr!(
+            "response.tier.virtual",
+            size = mib_label(EDITOR_MAX_BYTES as u64),
+            lines = EDITOR_MAX_LINES
+        )),
+        ViewTier::Preview => Some(tr!(
+            "response.tier.preview",
+            size = mib_label(MAX_BODY_BYTES),
+            head = mib_label(HEAD_BYTES as u64)
+        )),
+    }
+}
+
+pub fn theme_label(pref: ThemePref) -> SharedString {
+    match pref {
+        ThemePref::System => tr!("theme.system"),
+        ThemePref::Light => tr!("theme.light"),
+        ThemePref::Dark => tr!("theme.dark"),
+    }
+}
+
+pub fn language_label(pref: LanguagePref) -> SharedString {
+    match pref {
+        LanguagePref::System => tr!("language.system"),
+        LanguagePref::English => tr!("language.english"),
+        LanguagePref::Chinese => tr!("language.chinese"),
+        LanguagePref::Japanese => tr!("language.japanese"),
+    }
+}
+
+pub fn update_source_label(pref: UpdateSourcePref) -> SharedString {
+    match pref {
+        UpdateSourcePref::Auto => tr!("update_source.auto"),
+        UpdateSourcePref::Global => tr!("update_source.global"),
+        UpdateSourcePref::ChinaMirror => tr!("update_source.china_mirror"),
+    }
+}
+
+/// 「操作」页签一行的结果标签：通过 / 失败 / 跳过。
+pub fn op_outcome_label(outcome: &OpOutcome) -> SharedString {
+    match outcome {
+        OpOutcome::Passed => tr!("ops.result_passed"),
+        OpOutcome::Failed(_) => tr!("ops.result_failed"),
+        OpOutcome::Skipped(_) => tr!("ops.result_skipped"),
+    }
+}
+
+/// 失败 / 跳过的原因；通过没有说明。载荷（路径、头名、实际值）原文保留。
+pub fn op_detail(outcome: &OpOutcome) -> Option<SharedString> {
+    Some(match outcome {
+        OpOutcome::Passed => return None,
+        OpOutcome::Skipped(OpSkip::NoActiveEnvironment) => tr!("ops.skip_no_environment"),
+        OpOutcome::Skipped(OpSkip::NoGroup) => tr!("ops.skip_no_group"),
+        OpOutcome::Skipped(OpSkip::RequestFailed) => tr!("ops.skip_request_failed"),
+        OpOutcome::Failed(f) => match f {
+            OpFailure::EmptyKey => tr!("ops.fail_empty_key"),
+            OpFailure::InvalidKey(k) => tr!("ops.fail_invalid_key", key = k),
+            OpFailure::EmptyPath => tr!("ops.fail_empty_path"),
+            OpFailure::EmptyHeader => tr!("ops.fail_empty_header"),
+            OpFailure::BodyUnavailable => tr!("ops.fail_body_unavailable"),
+            OpFailure::BodyTooLarge => tr!(
+                "ops.fail_body_too_large",
+                size = mib_label(OPS_JSON_MAX_BYTES as u64)
+            ),
+            OpFailure::NotJson => tr!("ops.fail_not_json"),
+            OpFailure::PathNotFound(p) => tr!("ops.fail_path_not_found", path = p),
+            OpFailure::HeaderNotFound(n) => tr!("ops.fail_header_not_found", name = n),
+            OpFailure::Mismatch { actual, expected } => {
+                tr!("ops.fail_mismatch", actual = actual, expected = expected)
+            }
+            OpFailure::Unexpected { actual } => tr!("ops.fail_unexpected", actual = actual),
+            OpFailure::Missing => tr!("ops.fail_missing"),
+        },
+    })
+}
+
+/// Postman environment / globals 导入失败的原因：种类翻译，serde 给出的 JSON 细节原文保留。
+pub fn postman_env_error_line(error: &PostmanEnvError) -> SharedString {
+    match error {
+        PostmanEnvError::NotEnvironment => tr!("variables.import_not_environment"),
+        PostmanEnvError::Json(detail) => tr!("variables.import_invalid_json", detail = detail),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 测试进程的 locale 是 en（见 i18n::locale_test_lock）。
+    #[test]
+    fn error_kind_and_detail_split_label_from_payload() {
+        let _locale = crate::i18n::locale_test_lock();
+        let e = RequestError::Dns("lookup failed for example.invalid".into());
+        assert_eq!(error_kind(&e).as_ref(), "DNS lookup failed");
+        assert_eq!(
+            error_detail(&e).as_ref(),
+            "lookup failed for example.invalid"
+        );
+        assert_eq!(
+            error_detail(&RequestError::Timeout).as_ref(),
+            "The connection timed out"
+        );
+        assert_eq!(
+            prepare_error_line(&RequestError::InvalidUrl("x".into())).as_ref(),
+            "Invalid URL: x"
+        );
+        // 后台 panic：种类不是「网络错误」，细节去掉前缀
+        let panicked = RequestError::Other(format!("{PREPARE_PANIC_PREFIX}: index out of bounds"));
+        assert_eq!(
+            error_kind(&panicked).as_ref(),
+            "Background processing failed"
+        );
+        assert_eq!(error_detail(&panicked).as_ref(), "index out of bounds");
+    }
+
+    #[test]
+    fn content_kind_keeps_proper_nouns() {
+        let _locale = crate::i18n::locale_test_lock();
+        assert_eq!(content_kind_label(ContentKind::Json).as_ref(), "JSON");
+        assert_eq!(content_kind_label(ContentKind::Text).as_ref(), "Text");
+    }
+
+    #[test]
+    fn tier_notices_embed_the_thresholds() {
+        let _locale = crate::i18n::locale_test_lock();
+        let virt = tier_notice(ViewTier::Virtual).unwrap();
+        assert!(virt.contains("5 MB"), "{virt}");
+        assert!(virt.contains("200000"), "{virt}");
+        assert!(tier_notice(ViewTier::Editor).is_none());
+    }
+
+    #[test]
+    fn chinese_locale_is_wired_up() {
+        assert_eq!(
+            rust_i18n::t!("theme.system", locale = "zh-CN").as_ref(),
+            "跟随系统"
+        );
+        assert_eq!(
+            rust_i18n::t!("theme.system", locale = "en").as_ref(),
+            "System"
+        );
+    }
+
+    #[test]
+    fn op_failure_details_embed_payloads() {
+        let _locale = crate::i18n::locale_test_lock();
+        assert_eq!(op_outcome_label(&OpOutcome::Passed).as_ref(), "Passed");
+        assert_eq!(
+            op_detail(&OpOutcome::Failed(OpFailure::Mismatch {
+                actual: "200".into(),
+                expected: "201".into()
+            }))
+            .as_deref(),
+            Some("Expected 201, got 200")
+        );
+        assert_eq!(
+            op_detail(&OpOutcome::Failed(OpFailure::PathNotFound("$.a".into()))).as_deref(),
+            Some("Path not found: $.a")
+        );
+        assert_eq!(
+            op_detail(&OpOutcome::Skipped(OpSkip::NoGroup)).as_deref(),
+            Some("This request is not in a category")
+        );
+        assert_eq!(
+            op_detail(&OpOutcome::Skipped(OpSkip::RequestFailed)).as_deref(),
+            Some("Request failed, not run")
+        );
+        assert!(
+            op_detail(&OpOutcome::Failed(OpFailure::BodyTooLarge))
+                .unwrap()
+                .contains("8 MB")
+        );
+        assert_eq!(op_detail(&OpOutcome::Passed), None);
+    }
+
+    #[test]
+    fn japanese_locale_is_wired_up() {
+        assert_eq!(
+            rust_i18n::t!("theme.system", locale = "ja").as_ref(),
+            "システムに従う"
+        );
+        // 语言名在任何界面语言下都按它自己的语言显示
+        for locale in ["en", "zh-CN", "ja"] {
+            assert_eq!(
+                rust_i18n::t!("language.japanese", locale = locale).as_ref(),
+                "日本語",
+                "{locale}"
+            );
+        }
+    }
+
+    /// Postman 导入失败：原因的种类翻译，serde 的技术细节原文保留；不能漏出 core 的英文 Display。
+    #[test]
+    fn postman_env_errors_translate_the_kind_and_keep_the_detail() {
+        let _locale = crate::i18n::locale_test_lock();
+        assert_eq!(
+            postman_env_error_line(&PostmanEnvError::NotEnvironment).as_ref(),
+            "This file isn't a Postman environment or globals export"
+        );
+        let detail = "EOF while parsing an object at line 1 column 1";
+        assert_eq!(
+            postman_env_error_line(&PostmanEnvError::Json(detail.into())).as_ref(),
+            format!("The file isn't valid JSON: {detail}")
+        );
+        // 另两种界面语言也有译文
+        assert_eq!(
+            rust_i18n::t!("variables.import_not_environment", locale = "zh-CN").as_ref(),
+            "这不是 Postman 的 environment / globals 导出文件"
+        );
+        assert_eq!(
+            rust_i18n::t!(
+                "variables.import_invalid_json",
+                locale = "ja",
+                detail = detail
+            )
+            .as_ref(),
+            format!("ファイルが正しい JSON ではありません：{detail}")
+        );
+    }
+
+    #[test]
+    fn unresolved_vars_line_formats_names() {
+        let _locale = crate::i18n::locale_test_lock();
+        let mut names = BTreeSet::new();
+        names.insert("a".to_string());
+        names.insert("b".to_string());
+        assert_eq!(
+            unresolved_vars_line(&names).as_ref(),
+            "Undefined variables: a, b"
+        );
+    }
+}

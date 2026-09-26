@@ -1,0 +1,45 @@
+[package]
+name = "germal-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+# Windows 的图标与版本资源（其它平台上是空操作）
+build = "build.rs"
+
+[[bin]]
+name = "germal"
+path = "src/main.rs"
+
+[features]
+# 开发期元素检查器：cargo run -p germal-app --features inspector，应用内 ⌘⌥I（macOS）/ Ctrl+Shift+I 打开
+inspector = ["gpui-kit/inspector"]
+
+[dependencies]
+germal-core.workspace = true
+germal-recorder = { path = "../germal-recorder" }
+gpui-kit.workspace = true
+gpui-tokio.workspace = true
+gpui-updater.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+rust-i18n.workspace = true
+serde_json.workspace = true
+sys-locale.workspace = true
+
+[dev-dependencies]
+# TestAppContext / #[gpui_kit::test] 需要 test-support；只在测试构建启用（官方 test 文档的写法）
+gpui-kit = { workspace = true, features = ["test-support"] }
+# 每个持久化测试一个独立临时数据目录
+tempfile.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# X11 的窗口图标要交给 gpui 一张 image::RgbaImage；gpui 不重导出 image，自己声明同一个 0.25 系列
+# 由 cargo 统一成一个版本。只开 png 解码，logo 就是 PNG。
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[target.'cfg(target_os = "windows")'.build-dependencies]
+# build.rs 把生成的 .rc（图标 + VERSIONINFO）编进 exe 资源段；Zed 用的也是它
+embed-resource = "3"

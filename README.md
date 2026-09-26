@@ -4,28 +4,34 @@
 
 <div align="center">
 
-<img src="crates/getcat-app/assets/logo/getcat.png" width="128" alt="GetCat">
+<img src="crates/germal-app/assets/logo/germal.png" width="128" alt="Germal">
 
-# GetCat
+# Germal
 
 **用 Rust + [GPUI](https://gpui.rs) 打造的原生跨平台 HTTP 接口调试工具**
 
-No Postman, Just GetCat!
+No Postman, Just Germal!
 
 GPU 渲染 · 低资源占用 · 无需账号 · 数据全在本地 · No Electron, No Tauri, No WebView
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-007EC6?style=flat-square)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-1.97%2B-CE422B?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![GPUI](https://img.shields.io/badge/UI-GPUI-8B5CF6?style=flat-square)](https://gpui.rs)
-[![macOS](https://img.shields.io/badge/macOS-000000?style=flat-square&logo=apple&logoColor=white)](https://github.com/finch-xu/GetCat/releases)
-[![Linux](https://img.shields.io/badge/Linux-FCC624?style=flat-square&logo=linux&logoColor=black)](https://github.com/finch-xu/GetCat/releases)
-[![Windows](https://img.shields.io/badge/Windows-0078D6?style=flat-square&logo=windows&logoColor=white)](https://github.com/finch-xu/GetCat/releases)
+[![macOS](https://img.shields.io/badge/macOS-000000?style=flat-square&logo=apple&logoColor=white)](https://github.com/nermalcat69/germal/releases)
+[![Linux](https://img.shields.io/badge/Linux-FCC624?style=flat-square&logo=linux&logoColor=black)](https://github.com/nermalcat69/germal/releases)
+[![Windows](https://img.shields.io/badge/Windows-0078D6?style=flat-square&logo=windows&logoColor=white)](https://github.com/nermalcat69/germal/releases)
 
-[DeepWiki 文档](https://deepwiki.com/finch-xu/GetCat) · [官方网站](https://getcat.io/)
-
-<img src="assets/screenshot.png" width="900" alt="GetCat 主界面：左侧请求构造，右侧响应查看">
+<img src="assets/screenshot.png" width="900" alt="Germal 主界面：左侧请求构造，右侧响应查看">
 
 </div>
+
+> **Germal 是 [GetCat](https://github.com/finch-xu/GetCat) 的分支**（作者 finch-xu，遵循 Apache-2.0 协议）。GetCat 有的功能 Germal 都保留，并在此之上增加了下面「Germal 新增」里的功能。
+
+## Germal 新增
+
+- **压测**：选一条请求（当前 Tab 或录制的请求），可改 URL 与方法，按指定并发发送 N 次。专门的页面实时显示进度、失败数、状态码分布、延迟分位数、耗时，以及目标主机的 IPv4 / IPv6 地址、托管服务商（ASN）与 DNS 服务器。
+- **录制**：打开一个 Chromium 窗口，把你浏览的每个页面发出的 API（xhr / fetch）请求记进本地 SQLite——请求头（含 Authorization 与 Cookie）、请求体、耗时、连接与 TLS 详情。请求按项目、再按域名与子域名组织，可按 GET / POST / 其他过滤；右键可复制为 cURL 或送去压测。
+- **`.germal` 文件**：`germal-rec export` 先用 zstd 压缩、再用 AES-256-GCM 加密（密钥由口令经 Argon2id 派生），把录制库导出成单个 `.germal` 文件；`germal-rec unpack` 还原。
 
 ## 亮点
 
@@ -41,21 +47,23 @@ GPU 渲染 · 低资源占用 · 无需账号 · 数据全在本地 · No Electr
 
 ## 安装
 
-下载对应平台的包 [GitHub Releases](https://github.com/finch-xu/GetCat/releases)
+发布版本后，安装包会附在 GitHub Releases 上。
+
+下载对应平台的包 [GitHub Releases](https://github.com/nermalcat69/germal/releases)
 
 <table>
   <thead>
     <tr><th>平台</th><th>文件</th><th>下载</th><th>说明</th></tr>
   </thead>
   <tbody>
-    <tr><td>macOS（Apple Silicon）</td><td><code>GetCat-macos-arm64.dmg</code></td><td><a href="https://github.com/finch-xu/GetCat/releases/latest/download/GetCat-macos-arm64.dmg">全球下载</a> · <a href="https://d.mirror.catonthe.top/GetCat/GetCat-macos-arm64.dmg">中国下载</a></td><td rowspan="2">已签名公证，拖进「应用程序」即可</td></tr>
-    <tr><td>macOS（Intel）</td><td><code>GetCat-macos-x64.dmg</code></td><td><a href="https://github.com/finch-xu/GetCat/releases/latest/download/GetCat-macos-x64.dmg">全球下载</a> · <a href="https://d.mirror.catonthe.top/GetCat/GetCat-macos-x64.dmg">中国下载</a></td></tr>
-    <tr><td>Linux（x64）</td><td><code>GetCat-linux-x64.tar.gz</code></td><td><a href="https://github.com/finch-xu/GetCat/releases/latest/download/GetCat-linux-x64.tar.gz">全球下载</a> · <a href="https://d.mirror.catonthe.top/GetCat/GetCat-linux-x64.tar.gz">中国下载</a></td><td rowspan="2">解压得到 <code>getcat</code>，系统要求见下</td></tr>
-    <tr><td>Linux（arm64）</td><td><code>GetCat-linux-arm64.tar.gz</code></td><td><a href="https://github.com/finch-xu/GetCat/releases/latest/download/GetCat-linux-arm64.tar.gz">全球下载</a> · <a href="https://d.mirror.catonthe.top/GetCat/GetCat-linux-arm64.tar.gz">中国下载</a></td></tr>
-    <tr><td>Windows（免安装，x64） <strong>推荐</strong></td><td><code>GetCat-windows-x64.exe</code></td><td><a href="https://github.com/finch-xu/GetCat/releases/latest/download/GetCat-windows-x64.exe">全球下载</a> · <a href="https://d.mirror.catonthe.top/GetCat/GetCat-windows-x64.exe">中国下载</a></td><td rowspan="2">单文件，放哪都能跑，系统要求见下</td></tr>
-    <tr><td>Windows（免安装，arm64） <strong>推荐</strong></td><td><code>GetCat-windows-arm64.exe</code></td><td><a href="https://github.com/finch-xu/GetCat/releases/latest/download/GetCat-windows-arm64.exe">全球下载</a> · <a href="https://d.mirror.catonthe.top/GetCat/GetCat-windows-arm64.exe">中国下载</a></td></tr>
-    <tr><td>Windows（安装版，x64）</td><td><code>GetCat-windows-x64.msi</code></td><td><a href="https://github.com/finch-xu/GetCat/releases/latest/download/GetCat-windows-x64.msi">全球下载</a> · <a href="https://d.mirror.catonthe.top/GetCat/GetCat-windows-x64.msi">中国下载</a></td><td rowspan="2">装到当前用户目录，不需要管理员；开始菜单可启动</td></tr>
-    <tr><td>Windows（安装版，arm64）</td><td><code>GetCat-windows-arm64.msi</code></td><td><a href="https://github.com/finch-xu/GetCat/releases/latest/download/GetCat-windows-arm64.msi">全球下载</a> · <a href="https://d.mirror.catonthe.top/GetCat/GetCat-windows-arm64.msi">中国下载</a></td></tr>
+    <tr><td>macOS（Apple Silicon）</td><td><code>Germal-macos-arm64.dmg</code></td><td><a href="https://github.com/nermalcat69/germal/releases/latest/download/Germal-macos-arm64.dmg">下载</a></td><td rowspan="2">已签名公证，拖进「应用程序」即可</td></tr>
+    <tr><td>macOS（Intel）</td><td><code>Germal-macos-x64.dmg</code></td><td><a href="https://github.com/nermalcat69/germal/releases/latest/download/Germal-macos-x64.dmg">下载</a></td></tr>
+    <tr><td>Linux（x64）</td><td><code>Germal-linux-x64.tar.gz</code></td><td><a href="https://github.com/nermalcat69/germal/releases/latest/download/Germal-linux-x64.tar.gz">下载</a></td><td rowspan="2">解压得到 <code>germal</code>，系统要求见下</td></tr>
+    <tr><td>Linux（arm64）</td><td><code>Germal-linux-arm64.tar.gz</code></td><td><a href="https://github.com/nermalcat69/germal/releases/latest/download/Germal-linux-arm64.tar.gz">下载</a></td></tr>
+    <tr><td>Windows（免安装，x64） <strong>推荐</strong></td><td><code>Germal-windows-x64.exe</code></td><td><a href="https://github.com/nermalcat69/germal/releases/latest/download/Germal-windows-x64.exe">下载</a></td><td rowspan="2">单文件，放哪都能跑，系统要求见下</td></tr>
+    <tr><td>Windows（免安装，arm64） <strong>推荐</strong></td><td><code>Germal-windows-arm64.exe</code></td><td><a href="https://github.com/nermalcat69/germal/releases/latest/download/Germal-windows-arm64.exe">下载</a></td></tr>
+    <tr><td>Windows（安装版，x64）</td><td><code>Germal-windows-x64.msi</code></td><td><a href="https://github.com/nermalcat69/germal/releases/latest/download/Germal-windows-x64.msi">下载</a></td><td rowspan="2">装到当前用户目录，不需要管理员；开始菜单可启动</td></tr>
+    <tr><td>Windows（安装版，arm64）</td><td><code>Germal-windows-arm64.msi</code></td><td><a href="https://github.com/nermalcat69/germal/releases/latest/download/Germal-windows-arm64.msi">下载</a></td></tr>
   </tbody>
 </table>
 
@@ -66,14 +74,14 @@ GPU 渲染 · 低资源占用 · 无需账号 · 数据全在本地 · No Electr
 
 更老的发行版跑不了：Ubuntu 20.04、Debian 11，以及 RHEL / Rocky / AlmaLinux 9 —— 下限是 glibc 2.35，它们都在这之下。
 
-解压后直接运行 `./getcat` 即可。想让它出现在应用列表（Ubuntu 的「显示应用程序」）与 Dock 里，打开 **设置 → 通用 → 加入应用菜单**：GetCat 会把启动项与图标写到 `~/.local/share` 下，之后按 Super 键搜索 GetCat 就能启动，右键还能「添加到收藏夹」钉在 Dock 上；关掉开关即删除。Wayland 下窗口与 Dock 的图标也来自这份启动项，所以没打开开关时任务栏里显示的是通用图标。
+解压后直接运行 `./germal` 即可。想让它出现在应用列表（Ubuntu 的「显示应用程序」）与 Dock 里，打开 **设置 → 通用 → 加入应用菜单**：Germal 会把启动项与图标写到 `~/.local/share` 下，之后按 Super 键搜索 Germal 就能启动，右键还能「添加到收藏夹」钉在 Dock 上；关掉开关即删除。Wayland 下窗口与 Dock 的图标也来自这份启动项，所以没打开开关时任务栏里显示的是通用图标。
 
-启动项指向当前可执行文件，建议先把 `getcat` 放到固定位置再打开开关，例如：
+启动项指向当前可执行文件，建议先把 `germal` 放到固定位置再打开开关，例如：
 
 ```bash
-tar -xzf GetCat-linux-x64.tar.gz
-install -Dm755 getcat ~/.local/bin/getcat
-~/.local/bin/getcat
+tar -xzf Germal-linux-x64.tar.gz
+install -Dm755 germal ~/.local/bin/germal
+~/.local/bin/germal
 ```
 
 挪动过文件的话，把开关关掉再打开一次，路径就会更新。
@@ -108,8 +116,8 @@ vulkaninfo --summary
 
 两个版本都能用，推荐免安装版（ARM 设备，如骁龙笔记本，选 `-arm64` 后缀的包）：
 
-- **`GetCat-windows-<arch>.exe`（免安装，推荐）**：单文件，放 U 盘或任意目录直接双击，不写注册表。
-- **`GetCat-windows-<arch>.msi`（安装版）**：装到 `%LOCALAPPDATA%\Programs\GetCat`，不需要管理员权限，开始菜单里会出现 GetCat，也能从「应用和功能」里卸载。
+- **`Germal-windows-<arch>.exe`（免安装，推荐）**：单文件，放 U 盘或任意目录直接双击，不写注册表。
+- **`Germal-windows-<arch>.msi`（安装版）**：装到 `%LOCALAPPDATA%\Programs\Germal`，不需要管理员权限，开始菜单里会出现 Germal，也能从「应用和功能」里卸载。
 
 应用内的自动更新两者都支持：装了 MSI 的会拉新的 MSI 静默升级，免安装版直接替换 exe。
 
@@ -139,9 +147,9 @@ vulkaninfo --summary
 
 | 平台 | 目录 |
 |---|---|
-| macOS | `~/Library/Application Support/GetCat/` |
-| Linux | `$XDG_DATA_HOME/getcat/`（默认 `~/.local/share/getcat/`） |
-| Windows | `%APPDATA%\GetCat\data\` |
+| macOS | `~/Library/Application Support/Germal/` |
+| Linux | `$XDG_DATA_HOME/germal/`（默认 `~/.local/share/germal/`） |
+| Windows | `%APPDATA%\Germal\data\` |
 
 ```
 workspace.json          # Tab 顺序、侧栏、分栏方向、主题偏好
@@ -158,29 +166,29 @@ settings.json           # 应用设置
 
 ```
 crates/
-├─ getcat-core   # 无 UI 的核心：请求模型、发送（reqwest + tokio）、大响应分档与落盘、JSON 文件存储
-└─ getcat-app    # GPUI 界面：Workspace / RequestTab 状态、设置对话框、应用内更新
+├─ germal-core   # 无 UI 的核心：请求模型、发送（reqwest + tokio）、大响应分档与落盘、JSON 文件存储
+└─ germal-app    # GPUI 界面：Workspace / RequestTab 状态、设置对话框、应用内更新
 ```
 
 - UI 框架是 Zed 的 [gpui](https://github.com/zed-industries/zed/tree/main/crates/gpui) + [GPUI Kit](https://github.com/longbridge/gpui-kit)（gpui-component 组件库），按 Kit 0.6 官方形态只依赖 crates.io 的 `gpui-kit` 一个包，由它锁定配套的 gpui 版本。
 - 网络在 tokio 运行时里跑，结果通过 channel 回到 GPUI 主线程；后台处理（美化 / 建索引）被 `catch_unwind` 包裹，panic 只会显示为"后台处理异常"。
-- 持久化没有数据库：`getcat-core/src/store` 负责读写，写入走独立线程并做 500 ms 合并。
+- 持久化没有数据库：`germal-core/src/store` 负责读写，写入走独立线程并做 500 ms 合并。
 
 ### 构建与调试
 
 - Rust ≥ 1.97（edition 2024）。macOS 不需要额外工具链；Linux 需要 Vulkan 与 Wayland / X11 / fontconfig 头文件（清单见 `.github/workflows/ci.yml`）；Windows 需要 MSVC 工具链，Direct3D 11 已含在 Windows SDK 里。
-- 应用 logo：`crates/getcat-app/assets/logo/cat.png` 是去背的原画，`scripts/gen-logo.py` 把它合成成三份产物 —— app 内嵌的 `getcat.png`、macOS 图标源 `resources/macos/getcat-1024.png`、Windows exe 图标 `resources/windows/getcat.ico`；改 logo 后手动重跑脚本并提交产物（CI 不生成，需要 `pip install pillow numpy`）。
-- Windows 的 exe 图标与版本信息由 `crates/getcat-app/build.rs` 嵌入，只在 Windows 上原生编译时生效（从 macOS 交叉编译出的 exe 没有图标）。安装包定义在 `crates/getcat-app/resources/windows/GetCat.wxs`，需要 WiX v6：`dotnet tool install --global wix --version 6.*`。
+- 应用 logo：`crates/germal-app/assets/logo/cat.png` 是去背的原画，`scripts/gen-logo.py` 把它合成成三份产物 —— app 内嵌的 `germal.png`、macOS 图标源 `resources/macos/germal-1024.png`、Windows exe 图标 `resources/windows/germal.ico`；改 logo 后手动重跑脚本并提交产物（CI 不生成，需要 `pip install pillow numpy`）。
+- Windows 的 exe 图标与版本信息由 `crates/germal-app/build.rs` 嵌入，只在 Windows 上原生编译时生效（从 macOS 交叉编译出的 exe 没有图标）。安装包定义在 `crates/germal-app/resources/windows/Germal.wxs`，需要 WiX v6：`dotnet tool install --global wix --version 6.*`。
 
 ```bash
-cargo run -p getcat-app                         # 运行
+cargo run -p germal-app                         # 运行
 cargo test --workspace                          # 单元 + wiremock + gpui TestAppContext 测试
-RUST_LOG=debug cargo run -p getcat-app          # 调整日志级别
-cargo run -p getcat-app --features inspector    # 元素检查器：⌘⌥I / Ctrl+Shift+I 查看 id / role
-GETCAT_UPDATE_CHECK=1 cargo run -p getcat-app   # 开发构建也在启动时检查更新（只检查不安装）
+RUST_LOG=debug cargo run -p germal-app          # 调整日志级别
+cargo run -p germal-app --features inspector    # 元素检查器：⌘⌥I / Ctrl+Shift+I 查看 id / role
+GERMAL_UPDATE_CHECK=1 cargo run -p germal-app   # 开发构建也在启动时检查更新（只检查不安装）
 ```
 
-本地测试接口：`tools/testserver/server.py` 是一个零依赖（只用 Python 标准库）的小 server，专门提供难伺候的接口 —— 慢响应、超大响应体（1 / 5 / 10 / 20 / 50 MB）、chunked 滴流、大模型 SSE 流（OpenAI / Anthropic 两种事件格式，含 usage）、最小 MCP 端点、任意状态码、中途断连、超多超长响应头，用来手工验证大响应分档、流式进度与取消。启动后打开首页就是带参数说明的接口清单，每个示例都能一键复制完整 URL 粘到 GetCat。
+本地测试接口：`tools/testserver/server.py` 是一个零依赖（只用 Python 标准库）的小 server，专门提供难伺候的接口 —— 慢响应、超大响应体（1 / 5 / 10 / 20 / 50 MB）、chunked 滴流、大模型 SSE 流（OpenAI / Anthropic 两种事件格式，含 usage）、最小 MCP 端点、任意状态码、中途断连、超多超长响应头，用来手工验证大响应分档、流式进度与取消。启动后打开首页就是带参数说明的接口清单，每个示例都能一键复制完整 URL 粘到 Germal。
 
 ```bash
 python3 tools/testserver/server.py                             # 127.0.0.1:8765，首页即接口清单
